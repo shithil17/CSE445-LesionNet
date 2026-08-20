@@ -1,9 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms, models
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    roc_curve,
+    precision_recall_curve
+)
 import numpy as np
 import os
 import time
@@ -12,14 +23,19 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 class EfficientNetB4GradualUnfreezingTrainer:
-    def __init__(self, data_dir, batch_size=64, num_epochs=100, learning_rate=0.001):
+    def __init__(self, data_dir, val_data_dir='HAM10000_split/val', test_data_dir='HAM10000_split/test', batch_size=64, num_epochs=100, learning_rate=0.001):
         """
         EfficientNetB4 with gradual unfreezing:
         - Epochs 1-4: Train only head (frozen backbone)
         - Epoch 5: Unfreeze blocks 6, 7, 8 (deepest blocks)
         - Epoch 25: Unfreeze blocks 4, 5 (deeper blocks)
+        - data_dir = augmented TRAIN split (HAM10K_augmented_dataset)
+        - val_data_dir = raw VAL split, used only for best-model / early-stop / LR step
+        - test_data_dir = raw TEST split, evaluated exactly once at the end
         """
         self.data_dir = data_dir
+        self.val_data_dir = val_data_dir
+        self.test_data_dir = test_data_dir
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -33,7 +49,7 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print("="*60)
         
     def create_dataloaders(self):
-        """Create train/val dataloaders with 80-20 split and manual class order"""
+        """Train on the augmented train split; early-stopping on raw val; final eval on raw test."""
         # EfficientNetB4 optimal input size is 380x380, but using 224x224 for consistency
         train_transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -45,29 +61,30 @@ class EfficientNetB4GradualUnfreezingTrainer:
             transforms.ToTensor(),
         ])
         
-        full_dataset = datasets.ImageFolder(root=self.data_dir, transform=train_transform)
+        train_dataset = datasets.ImageFolder(root=self.data_dir, transform=train_transform)
+        val_dataset = datasets.ImageFolder(root=self.val_data_dir, transform=val_transform)
+        test_dataset = datasets.ImageFolder(root=self.test_data_dir, transform=val_transform)
         
         # Update class names and count to match ImageFolder's found classes
-        self.class_names = full_dataset.classes
+        self.class_names = train_dataset.classes
         self.num_classes = len(self.class_names)
         
-        train_size = int(0.8 * len(full_dataset))
-        val_size = len(full_dataset) - train_size
-        train_dataset, val_dataset = random_split(
-            full_dataset, [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)
-        )
-        
-        val_dataset.dataset.transform = val_transform
+        for name, ds in [("val", val_dataset), ("test", test_dataset)]:
+            if self.class_names != ds.classes:
+                raise ValueError(
+                    f"Train/{name} class folders differ: {self.class_names} vs {ds.classes}"
+                )
         
         train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4, pin_memory=True)
         
         print(f"Training samples: {len(train_dataset)}")
         print(f"Validation samples: {len(val_dataset)}")
+        print(f"Test samples: {len(test_dataset)}")
         print(f"Classes (ImageFolder order): {self.class_names}")
         
-        return train_loader, val_loader
+        return train_loader, val_loader, test_loader
     
     def build_model(self):
         """Build EfficientNetB4 with gradual unfreezing capability"""
@@ -162,6 +179,7 @@ class EfficientNetB4GradualUnfreezingTrainer:
         total = 0
         all_preds = []
         all_targets = []
+        all_probs = []
         
         pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{self.num_epochs} [Val]  ", leave=False, ncols=100)
         
@@ -171,6 +189,8 @@ class EfficientNetB4GradualUnfreezingTrainer:
                 output = model(data)
                 loss = criterion(output, target)
                 
+                probabilities = torch.softmax(output, dim=1)
+                
                 running_loss += loss.item()
                 _, predicted = torch.max(output.data, 1)
                 total += target.size(0)
@@ -178,6 +198,7 @@ class EfficientNetB4GradualUnfreezingTrainer:
                 
                 all_preds.extend(predicted.cpu().numpy())
                 all_targets.extend(target.cpu().numpy())
+                all_probs.extend(probabilities.cpu().numpy())
                 
                 current_loss = running_loss / (batch_idx + 1)
                 current_acc = 100. * correct / total
@@ -186,7 +207,13 @@ class EfficientNetB4GradualUnfreezingTrainer:
         epoch_loss = running_loss / len(val_loader)
         epoch_acc = 100. * correct / total
         
-        return epoch_loss, epoch_acc, np.array(all_preds), np.array(all_targets)
+        return (
+            epoch_loss,
+            epoch_acc,
+            np.array(all_preds),
+            np.array(all_targets),
+            np.array(all_probs)
+        )
     
     def plot_training_curves(self, history):
         """Plot and save training curves"""
@@ -197,6 +224,8 @@ class EfficientNetB4GradualUnfreezingTrainer:
         # Training Accuracy
         ax1.plot(epochs, history['train_acc'], 'b-', label='Training Accuracy')
         ax1.plot(epochs, history['val_acc'], 'r-', label='Validation Accuracy')
+        ax1.axvline(x=6, linestyle='--', color='gray', label='Unfreeze Blocks 6-8')
+        ax1.axvline(x=26, linestyle='--', color='black', label='Unfreeze Blocks 4-5')
         ax1.set_title('Training & Validation Accuracy')
         ax1.set_xlabel('Epoch')
         ax1.set_ylabel('Accuracy (%)')
@@ -206,6 +235,8 @@ class EfficientNetB4GradualUnfreezingTrainer:
         # Training Loss
         ax2.plot(epochs, history['train_loss'], 'b-', label='Training Loss')
         ax2.plot(epochs, history['val_loss'], 'r-', label='Validation Loss')
+        ax2.axvline(x=6, linestyle='--', color='gray', label='Unfreeze Blocks 6-8')
+        ax2.axvline(x=26, linestyle='--', color='black', label='Unfreeze Blocks 4-5')
         ax2.set_title('Training & Validation Loss')
         ax2.set_xlabel('Epoch')
         ax2.set_ylabel('Loss')
@@ -222,6 +253,8 @@ class EfficientNetB4GradualUnfreezingTrainer:
         
         # Validation Accuracy (zoomed)
         ax4.plot(epochs, history['val_acc'], 'r-')
+        ax4.axvline(x=6, linestyle='--', color='gray', label='Unfreeze Blocks 6-8')
+        ax4.axvline(x=26, linestyle='--', color='black', label='Unfreeze Blocks 4-5')
         ax4.set_title('Validation Accuracy (Detailed)')
         ax4.set_xlabel('Epoch')
         ax4.set_ylabel('Accuracy (%)')
@@ -232,24 +265,178 @@ class EfficientNetB4GradualUnfreezingTrainer:
         plt.close()
         print("📊 Training curves saved as 'training_curves.png'")
     
-    def plot_confusion_matrix(self, y_true, y_pred, epoch):
-        """Plot confusion matrix"""
-        cm = confusion_matrix(y_true, y_pred)
+    def _plot_confusion_matrix(self, y_true, y_pred, title, filename):
+        """Shared confusion matrix heatmap"""
+        cm = confusion_matrix(y_true, y_pred, labels=np.arange(self.num_classes))
         
         plt.figure(figsize=(10, 8))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                    xticklabels=self.class_names,
                    yticklabels=self.class_names)
-        plt.title(f'Confusion Matrix - EfficientNetB4 (Epoch {epoch+1})')
+        plt.title(title)
         plt.ylabel('True Label')
         plt.xlabel('Predicted Label')
         plt.tight_layout()
-        plt.savefig(f'efficientnetb4_confusion_matrix_epoch_{epoch+1}.png', dpi=300)
+        plt.savefig(filename, dpi=300)
         plt.close()
+    
+    def plot_confusion_matrix(self, y_true, y_pred, epoch):
+        """Plot confusion matrix for an epoch"""
+        self._plot_confusion_matrix(
+            y_true, y_pred,
+            f'Confusion Matrix - EfficientNetB4 (Epoch {epoch+1})',
+            f'efficientnetb4_confusion_matrix_epoch_{epoch+1}.png'
+        )
+    
+    def plot_final_confusion_matrix(self, y_true, y_pred):
+        """Plot the final confusion matrix from the best model"""
+        self._plot_confusion_matrix(
+            y_true, y_pred,
+            'Confusion Matrix - EfficientNetB4 (Final)',
+            'confusion_matrix.png'
+        )
+        print("📊 Confusion matrix saved as 'confusion_matrix.png'")
+    
+    def plot_roc_curves(self, y_true, probabilities):
+        """Plot one-vs-rest ROC curves for all classes"""
+        plt.figure(figsize=(8, 6))
+        for i, class_name in enumerate(self.class_names):
+            binary_targets = (y_true == i).astype(int)
+            fpr, tpr, _ = roc_curve(binary_targets, probabilities[:, i])
+            roc_auc = roc_auc_score(binary_targets, probabilities[:, i])
+            plt.plot(fpr, tpr, label=f'{class_name} (AUC={roc_auc:.3f})')
+        plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Random')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('ROC Curves - EfficientNetB4')
+        plt.legend(loc='lower right')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('roc_curves.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("📊 ROC curves saved as 'roc_curves.png'")
+    
+    def plot_pr_curves(self, y_true, probabilities):
+        """Plot one-vs-rest Precision-Recall curves and return per-class PR-AUC"""
+        pr_auc_per_class = {}
+        plt.figure(figsize=(8, 6))
+        for i, class_name in enumerate(self.class_names):
+            binary_targets = (y_true == i).astype(int)
+            precision, recall, _ = precision_recall_curve(binary_targets, probabilities[:, i])
+            pr_auc = average_precision_score(binary_targets, probabilities[:, i])
+            pr_auc_per_class[class_name] = pr_auc
+            plt.plot(recall, precision, label=f'{class_name} (AP={pr_auc:.3f})')
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title('Precision-Recall Curves - EfficientNetB4')
+        plt.legend(loc='best')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('precision_recall_curves.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("📊 Precision-Recall curves saved as 'precision_recall_curves.png'")
+        return pr_auc_per_class
+    
+    def plot_confidence_distribution(self, confidence, correct):
+        """Plot confidence distributions for correct vs incorrect predictions"""
+        plt.figure(figsize=(8, 6))
+        plt.hist(confidence[correct], bins=20, alpha=0.6, label='Correct', color='green', range=(0, 1))
+        plt.hist(confidence[~correct], bins=20, alpha=0.6, label='Incorrect', color='red', range=(0, 1))
+        plt.xlabel('Confidence (max softmax probability)')
+        plt.ylabel('Count')
+        plt.title('Confidence Distribution - Correct vs Incorrect')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('confidence_distribution.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("📊 Confidence distribution saved as 'confidence_distribution.png'")
+    
+    def plot_calibration_curve(self, y_true, y_pred, probabilities, n_bins=10):
+        """Plot a reliability diagram and compute Expected Calibration Error"""
+        confidence = np.max(probabilities, axis=1)
+        accuracies = (y_pred == y_true).astype(float)
+        n = len(confidence)
+        
+        bin_confidences = []
+        bin_accuracies = []
+        ece = 0.0
+        
+        for i in range(n_bins):
+            lower = i / n_bins
+            upper = (i + 1) / n_bins
+            if i == 0:
+                mask = confidence <= upper
+            else:
+                mask = (confidence > lower) & (confidence <= upper)
+            size = mask.sum()
+            if size > 0:
+                bin_conf = confidence[mask].mean()
+                bin_acc = accuracies[mask].mean()
+                ece += (size / n) * abs(bin_acc - bin_conf)
+            else:
+                bin_conf = (lower + upper) / 2
+                bin_acc = 0.0
+            bin_confidences.append(bin_conf)
+            bin_accuracies.append(bin_acc)
+        
+        plt.figure(figsize=(8, 6))
+        plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Perfect calibration')
+        plt.plot(bin_confidences, bin_accuracies, marker='o', label='Model calibration')
+        plt.xlabel('Mean Confidence')
+        plt.ylabel('Accuracy')
+        plt.title(f'Calibration Curve - EfficientNetB4 (ECE={ece:.4f})')
+        plt.legend()
+        plt.xlim(0, 1)
+        plt.ylim(0, 1)
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('calibration_curve.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("📊 Calibration curve saved as 'calibration_curve.png'")
+        return ece
+    
+    def plot_generalization_gap(self, history):
+        """Plot train-vs-val accuracy and loss gaps to visualize overfitting"""
+        epochs = range(1, len(history['train_loss']) + 1)
+        accuracy_gap = np.array(history['train_acc']) - np.array(history['val_acc'])
+        loss_gap = np.array(history['val_loss']) - np.array(history['train_loss'])
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        ax1.plot(epochs, accuracy_gap, 'b-o', label='Accuracy Gap (train - val)')
+        ax1.set_title('Accuracy Generalization Gap')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Accuracy Gap (%)')
+        ax1.legend()
+        ax1.grid(True)
+        ax2.plot(epochs, loss_gap, 'r-o', label='Loss Gap (val - train)')
+        ax2.set_title('Loss Generalization Gap')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Loss Gap')
+        ax2.legend()
+        ax2.grid(True)
+        plt.tight_layout()
+        plt.savefig('generalization_gap.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("📊 Generalization gap saved as 'generalization_gap.png'")
+    
+    def plot_trainable_parameters(self, history):
+        """Plot the number of trainable parameters per epoch"""
+        epochs = range(1, len(history['trainable_params']) + 1)
+        plt.figure(figsize=(8, 6))
+        plt.plot(epochs, history['trainable_params'], 'm-o')
+        plt.title('Trainable Parameters over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('Trainable Parameters')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('trainable_parameters.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print("📊 Trainable parameters saved as 'trainable_parameters.png'")
     
     def train(self):
         """Full training pipeline with gradual unfreezing"""
-        train_loader, val_loader = self.create_dataloaders()
+        train_loader, val_loader, test_loader = self.create_dataloaders()
         model = self.build_model()
         criterion = nn.CrossEntropyLoss()
         
@@ -257,13 +444,14 @@ class EfficientNetB4GradualUnfreezingTrainer:
         optimizer = optim.Adam(model.classifier.parameters(), lr=self.learning_rate)
         
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-7, verbose=True
+            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-7
         )
         
         history = {
             'train_loss': [], 'train_acc': [],
             'val_loss': [], 'val_acc': [],
-            'lr': []
+            'lr': [],
+            'trainable_params': []
         }
         
         best_val_acc = 0.0
@@ -297,9 +485,11 @@ class EfficientNetB4GradualUnfreezingTrainer:
             train_loss, train_acc = self.train_epoch(model, train_loader, criterion, optimizer, epoch)
             torch.save(model.state_dict(), f'efficientnetb4_checkpoint_model_epoch{epoch}.pth')
 
-            
+            # Track trainable parameters for the unfreeze-jump plot
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
             # Validation
-            val_loss, val_acc, val_preds, val_targets = self.validate(model, val_loader, criterion, epoch)
+            val_loss, val_acc, val_preds, val_targets, _ = self.validate(model, val_loader, criterion, epoch)
             
             # Record history
             history['train_loss'].append(train_loss)
@@ -307,6 +497,7 @@ class EfficientNetB4GradualUnfreezingTrainer:
             history['val_loss'].append(val_loss)
             history['val_acc'].append(val_acc)
             history['lr'].append(optimizer.param_groups[0]['lr'])
+            history['trainable_params'].append(trainable_params)
             
             # Scheduler step
             scheduler.step(val_loss)
@@ -359,11 +550,13 @@ class EfficientNetB4GradualUnfreezingTrainer:
         model.load_state_dict(checkpoint['model_state_dict'])
         best_epoch = checkpoint['epoch']
         
-        # Final evaluation
-        final_loss, final_acc, final_preds, final_targets = self.validate(model, val_loader, criterion, best_epoch)
+        # Final evaluation on the best model (held-out test set, touched once)
+        final_loss, final_acc, final_preds, final_targets, final_probs = self.validate(model, test_loader, criterion, best_epoch)
         
-        # Plot training curves
+        # Plot training curves + training diagnostics
         self.plot_training_curves(history)
+        self.plot_trainable_parameters(history)
+        self.plot_generalization_gap(history)
         
         # Print final metrics
         print("\n" + "="*60)
@@ -389,9 +582,96 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print(f"{'Weighted Avg':<10} {report['weighted avg']['precision']:<12.4f} "
               f"{report['weighted avg']['recall']:<12.4f} {report['weighted avg']['f1-score']:<12.4f}")
         
+        # ===== EXTENDED FINAL METRICS =====
+        balanced_acc = balanced_accuracy_score(final_targets, final_preds)
+        print(f"\nBALANCED ACCURACY: {balanced_acc:.4f}")
+        
+        macro_precision = precision_score(final_targets, final_preds, average='macro', zero_division=0)
+        macro_recall = recall_score(final_targets, final_preds, average='macro', zero_division=0)
+        macro_f1 = f1_score(final_targets, final_preds, average='macro', zero_division=0)
+        weighted_f1 = f1_score(final_targets, final_preds, average='weighted', zero_division=0)
+        
+        # Per-class specificity, ROC-AUC, PR-AUC
+        cm = confusion_matrix(final_targets, final_preds, labels=np.arange(self.num_classes))
+        specificity_per_class = {}
+        roc_auc_per_class = {}
+        for i, class_name in enumerate(self.class_names):
+            tp = cm[i, i]
+            fn = cm[i, :].sum() - tp
+            fp = cm[:, i].sum() - tp
+            tn = cm.sum() - (tp + fn + fp)
+            specificity_per_class[class_name] = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            
+            binary_targets = (final_targets == i).astype(int)
+            roc_auc_per_class[class_name] = roc_auc_score(binary_targets, final_probs[:, i])
+        
+        macro_roc_auc = roc_auc_score(final_targets, final_probs, multi_class='ovr', average='macro')
+        weighted_roc_auc = roc_auc_score(final_targets, final_probs, multi_class='ovr', average='weighted')
+        print(f"MACRO ROC-AUC: {macro_roc_auc:.4f}")
+        print(f"WEIGHTED ROC-AUC: {weighted_roc_auc:.4f}")
+        
+        self.plot_roc_curves(final_targets, final_probs)
+        pr_auc_per_class = self.plot_pr_curves(final_targets, final_probs)
+        macro_pr_auc = np.mean(list(pr_auc_per_class.values()))
+        print(f"MACRO PR-AUC: {macro_pr_auc:.4f}")
+        
+        # Top-2 / Top-3 accuracy
+        top2_preds = np.argsort(final_probs, axis=1)[:, -2:]
+        top3_preds = np.argsort(final_probs, axis=1)[:, -3:]
+        top2_acc = np.mean([t in p for t, p in zip(final_targets, top2_preds)])
+        top3_acc = np.mean([t in p for t, p in zip(final_targets, top3_preds)])
+        print(f"\nTOP-1 ACCURACY: {final_acc:.2f}%")
+        print(f"TOP-2 ACCURACY: {top2_acc * 100:.2f}%")
+        print(f"TOP-3 ACCURACY: {top3_acc * 100:.2f}%")
+        
+        # Confidence analysis
+        confidence = np.max(final_probs, axis=1)
+        correct = final_preds == final_targets
+        mean_confidence = np.mean(confidence)
+        correct_confidence = np.mean(confidence[correct]) if np.any(correct) else 0.0
+        incorrect_confidence = np.mean(confidence[~correct]) if np.any(~correct) else 0.0
+        print(f"\nMean confidence: {mean_confidence:.4f}")
+        print(f"Mean confidence when correct: {correct_confidence:.4f}")
+        print(f"Mean confidence when incorrect: {incorrect_confidence:.4f}")
+        
+        self.plot_confusion_matrix(final_targets, final_preds, best_epoch)
+        self.plot_final_confusion_matrix(final_targets, final_preds)
+        self.plot_confidence_distribution(confidence, correct)
+        ece = self.plot_calibration_curve(final_targets, final_preds, final_probs)
+        print(f"EXPECTED CALIBRATION ERROR: {ece:.4f}")
+        
+        # ===== FINAL MODEL EVALUATION SUMMARY =====
         print("\n" + "="*60)
-        print(f"🎯 OVERALL ACCURACY: {final_acc:.2f}%")
+        print("FINAL MODEL EVALUATION")
         print("="*60)
+        print(f"\nOverall Accuracy       : {final_acc / 100:.4f}")
+        print(f"Balanced Accuracy      : {balanced_acc:.4f}")
+        print(f"\nMacro Precision        : {macro_precision:.4f}")
+        print(f"Macro Recall           : {macro_recall:.4f}")
+        print(f"Macro F1               : {macro_f1:.4f}")
+        print(f"\nWeighted F1            : {weighted_f1:.4f}")
+        print(f"\nMacro ROC-AUC          : {macro_roc_auc:.4f}")
+        print(f"Weighted ROC-AUC       : {weighted_roc_auc:.4f}")
+        print(f"\nMacro PR-AUC           : {macro_pr_auc:.4f}")
+        print(f"\nTop-1 Accuracy         : {final_acc / 100:.4f}")
+        print(f"Top-2 Accuracy         : {top2_acc:.4f}")
+        print(f"Top-3 Accuracy         : {top3_acc:.4f}")
+        print(f"\nMean Confidence        : {mean_confidence:.4f}")
+        print(f"Correct Confidence     : {correct_confidence:.4f}")
+        print(f"Incorrect Confidence   : {incorrect_confidence:.4f}")
+        print(f"\nExpected Calibration Error : {ece:.4f}")
+        
+        print("\n------------------------------------------------------------")
+        print("PER-CLASS METRICS")
+        print("------------------------------------------------------------")
+        print(f"{'Class':<10} {'Precision':<12} {'Recall':<12} {'Specificity':<12} "
+              f"{'F1':<12} {'ROC-AUC':<10} {'PR-AUC':<10}")
+        print("-"*72)
+        for class_name in self.class_names:
+            m = report[class_name]
+            print(f"{class_name:<10} {m['precision']:<12.4f} {m['recall']:<12.4f} "
+                  f"{specificity_per_class[class_name]:<12.4f} {m['f1-score']:<12.4f} "
+                  f"{roc_auc_per_class[class_name]:<10.4f} {pr_auc_per_class[class_name]:<10.4f}")
         
         # Save metrics
         metrics = {
@@ -400,7 +680,23 @@ class EfficientNetB4GradualUnfreezingTrainer:
             'total_training_time': total_training_time,
             'epochs_trained': len(history['train_loss']),
             'best_epoch': best_epoch,
-            'history': history
+            'history': history,
+            'balanced_accuracy': balanced_acc,
+            'macro_precision': macro_precision,
+            'macro_recall': macro_recall,
+            'macro_f1': macro_f1,
+            'macro_roc_auc': macro_roc_auc,
+            'weighted_roc_auc': weighted_roc_auc,
+            'macro_pr_auc': macro_pr_auc,
+            'top2_accuracy': top2_acc,
+            'top3_accuracy': top3_acc,
+            'mean_confidence': mean_confidence,
+            'correct_confidence': correct_confidence,
+            'incorrect_confidence': incorrect_confidence,
+            'ece': ece,
+            'specificity_per_class': specificity_per_class,
+            'roc_auc_per_class': roc_auc_per_class,
+            'pr_auc_per_class': pr_auc_per_class
         }
         torch.save(metrics, 'efficientnetb4_training_metrics.pth')
         
@@ -408,7 +704,7 @@ class EfficientNetB4GradualUnfreezingTrainer:
 
 if __name__ == "__main__":
     trainer = EfficientNetB4GradualUnfreezingTrainer(
-        data_dir='../Dattaset',
+        data_dir='HAM10K_augmented_dataset',
         batch_size=64,
         num_epochs=50,
         learning_rate=0.001

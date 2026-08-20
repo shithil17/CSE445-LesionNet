@@ -1,38 +1,26 @@
 import os
-import csv
-import math
 import shutil
 import random
 import warnings
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 
-import torch
 from torchvision import transforms
 from PIL import Image
-
-try:
-    import pandas as pd  # for xlsx/csv flexibility
-    HAS_PANDAS = True
-except Exception:
-    HAS_PANDAS = False
 
 
 class HAM10000AugmentorFromTable:
     def __init__(
         self,
         image_dir: str,
-        labels_path: str,
         output_dir: str,
         seed: int = 42,
     ):
         """
-        image_dir: directory containing all .jpg dermoscopy images (flat)
-        labels_path: CSV or XLSX with columns:
-            image, MEL, NV, BCC, AKIEC, BKL, DF, VASC (one-hot)
+        image_dir: class-organized directory tree, image_dir/<CLASS>/*.jpg
+            (CLASS in AKIEC, BCC, BKL, DF, MEL, NV, VASC)
         output_dir: where to write output_dir/<CLASS>/images.jpg (+ aug)
         """
         self.image_dir = image_dir
-        self.labels_path = labels_path
         self.output_dir = output_dir
         self.class_names = ["AKIEC", "BCC", "BKL", "DF", "MEL", "NV", "VASC"]
 
@@ -72,111 +60,22 @@ class HAM10000AugmentorFromTable:
         self.to_tensor = transforms.ToTensor()
         self.to_pil = transforms.ToPILImage()
 
-        # Load label table and image indexes per class
-        self.image_to_class, self.class_to_images = self._load_labels()
+        # Index images by scanning the class folders (ImageFolder-style)
+        self.class_to_images = self._scan_classes()
 
-    def _read_table(self):
-        ext = os.path.splitext(self.labels_path)[1].lower()
-        if ext in [".xlsx", ".xls"]:
-            if not HAS_PANDAS:
-                raise RuntimeError(
-                    "pandas is required to read Excel. Install pandas or convert to CSV."
-                )
-            df = pd.read_excel(self.labels_path)
-            return df
-        elif ext == ".csv":
-            if HAS_PANDAS:
-                return pd.read_csv(self.labels_path)
-            # Fallback csv reader
-            with open(self.labels_path, newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-            # Convert to a pandas-like minimal interface
-            if not HAS_PANDAS:
-                # Create a simple structure
-                return rows
-        else:
-            raise ValueError("labels_path must be .csv or .xlsx")
-
-    def _normalize_rows(self, rows):
-        # Coerce to list[dict] with required columns
-        required = ["image", "MEL", "NV", "BCC", "AKIEC", "BKL", "DF", "VASC"]
-        if HAS_PANDAS and hasattr(rows, "to_dict"):
-            rows = rows.to_dict(orient="records")
-        # Lowercase headers in rows; accept numeric 0/1 or string "0"/"1"
-        norm = []
-        for r in rows:
-            r_norm = {}
-            for k, v in r.items():
-                r_norm[k.strip()] = v
-            # Validate required columns exist
-            for col in required:
-                if col not in r_norm:
-                    raise KeyError(f"Missing column '{col}' in labels file")
-            norm.append(r_norm)
-        return norm
-
-    def _row_to_class(self, row: dict) -> Optional[str]:
-        # HAM10000 is single-label; if multiple 1s, pick the first by class order
-        hits = []
+    def _scan_classes(self) -> Dict[str, List[str]]:
+        class_to_images: Dict[str, List[str]] = {}
         for c in self.class_names:
-            val = row.get(c, 0)
-            try:
-                v = int(val)
-            except Exception:
-                try:
-                    v = int(float(val))
-                except Exception:
-                    v = 0
-            if v == 1:
-                hits.append(c)
-        if len(hits) == 0:
-            return None
-        if len(hits) > 1:
-            warnings.warn(
-                f"Row for {row.get('image')} has multiple labels {hits}; "
-                f"using {hits[0]}"
-            )
-        return hits[0]
-
-    def _load_labels(self) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
-        rows = self._read_table()
-        rows = self._normalize_rows(rows)
-
-        image_to_class: Dict[str, str] = {}
-        class_to_images: Dict[str, List[str]] = {c: [] for c in self.class_names}
-
-        for r in rows:
-            image_key = str(r["image"]).strip()
-            # allow bare IDs or filenames; add .jpg if needed
-            if not image_key.lower().endswith((".jpg", ".jpeg", ".png")):
-                candidate_jpg = image_key + ".jpg"
-            else:
-                candidate_jpg = image_key
-
-            label = self._row_to_class(r)
-            if label is None:
+            cdir = os.path.join(self.image_dir, c)
+            if not os.path.isdir(cdir):
+                warnings.warn(f"Class folder not found: {cdir}; skipping")
+                class_to_images[c] = []
                 continue
-
-            # ensure file exists
-            src_path = os.path.join(self.image_dir, candidate_jpg)
-            if not os.path.exists(src_path):
-                # try .jpeg/.png fallbacks
-                alt = None
-                for ext in [".jpeg", ".png"]:
-                    p = os.path.join(self.image_dir, image_key + ext)
-                    if os.path.exists(p):
-                        alt = p
-                        candidate_jpg = image_key + ext
-                        break
-                if alt is None:
-                    warnings.warn(f"Image not found: {candidate_jpg}; skipping")
-                    continue
-
-            image_to_class[candidate_jpg] = label
-            class_to_images[label].append(candidate_jpg)
-
-        return image_to_class, class_to_images
+            class_to_images[c] = sorted(
+                f for f in os.listdir(cdir)
+                if f.lower().endswith((".jpg", ".jpeg", ".png"))
+            )
+        return class_to_images
 
     def get_class_distribution(self) -> Dict[str, int]:
         return {c: len(self.class_to_images.get(c, [])) for c in self.class_names}
@@ -190,7 +89,7 @@ class HAM10000AugmentorFromTable:
             target = self.target_counts[c]
             need = max(0, target - original)
             factor = (target - original) / original if original > 0 and original < target else 0
-            print(f"  {c}: {original} → {target} (need {need})")
+            print(f"  {c}: {original} -> {target} (need {need})")
             factors[c] = {
                 "original": original,
                 "target": target,
@@ -200,10 +99,11 @@ class HAM10000AugmentorFromTable:
         return factors
 
     def _copy_originals(self, class_name: str, files: List[str]):
+        src_dir = os.path.join(self.image_dir, class_name)
         out_dir = os.path.join(self.output_dir, class_name)
         copied = 0
         for fname in files:
-            src = os.path.join(self.image_dir, fname)
+            src = os.path.join(src_dir, fname)
             dst = os.path.join(out_dir, fname)
             if not os.path.exists(dst):
                 shutil.copy2(src, dst)
@@ -214,6 +114,7 @@ class HAM10000AugmentorFromTable:
         if need <= 0:
             return 0
 
+        src_dir = os.path.join(self.image_dir, class_name)
         out_dir = os.path.join(self.output_dir, class_name)
         augmented = 0
 
@@ -226,7 +127,7 @@ class HAM10000AugmentorFromTable:
 
         while augmented < need:
             fname = original_files[idx % n]
-            src_path = os.path.join(self.image_dir, fname)
+            src_path = os.path.join(src_dir, fname)
             try:
                 img = Image.open(src_path).convert("RGB")
             except Exception as e:
@@ -248,29 +149,24 @@ class HAM10000AugmentorFromTable:
         return augmented
 
     def run(self):
-        print("Starting HAM10000 augmentation from table...")
+        print("Starting HAM10000 augmentation from split folder...")
         print("=" * 60)
         factors = self.calculate_augmentation_factors()
         print("=" * 60)
 
-        total_final = 0
         for c in self.class_names:
             originals = self.class_to_images.get(c, [])
             print(f"\nProcessing {c}:")
             copied = self._copy_originals(c, originals)
             print(f"  Copied {copied} originals (existing files skipped)")
 
-            # NV is majority; still copy originals but no augmentation beyond target logic
             need = factors[c]["augmented_needed"]
-            if need > 0 and c != "NV":
+            if need > 0:
                 print(f"  Generating {need} augmented images...")
                 made = self._augment_to_target(c, originals, need)
                 print(f"  {c}: Generated {made} augmented images")
             else:
-                if need <= 0:
-                    print("  No augmentation needed (at or above target).")
-                else:
-                    print("  NV is majority class; skipping augmentation.")
+                print("  No augmentation needed (at or above target).")
 
         print("\n" + "=" * 60)
         print("Augmentation complete! Final distribution:")
@@ -294,8 +190,7 @@ class HAM10000AugmentorFromTable:
 
 if __name__ == "__main__":
     augmentor = HAM10000AugmentorFromTable(
-        image_dir="../Dataset/HAM10000_images",
-        labels_path="../Dataset/HAM10000_groundtruth.csv",  # or .xlsx
+        image_dir="HAM10000_split/train",
         output_dir="HAM10K_augmented_dataset",
     )
     augmentor.run()
