@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import datasets, transforms, models
 from sklearn.metrics import (
     classification_report,
@@ -23,15 +23,16 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 class EfficientNetB4GradualUnfreezingTrainer:
-    def __init__(self, data_dir, val_data_dir='HAM10000_split/val', test_data_dir='HAM10000_split/test', batch_size=64, num_epochs=100, learning_rate=0.001):
+    def __init__(self, data_dir, val_data_dir='HAM10000_split/val', test_data_dir='HAM10000_split/test', batch_size=64, num_epochs=100, learning_rate=0.001, sampler_mode='sqrt'):
         """
         EfficientNetB4 with gradual unfreezing:
         - Epochs 1-4: Train only head (frozen backbone)
         - Epoch 5: Unfreeze blocks 6, 7, 8 (deepest blocks)
         - Epoch 25: Unfreeze blocks 4, 5 (deeper blocks)
-        - data_dir = augmented TRAIN split (HAM10K_augmented_dataset)
+        - data_dir = raw TRAIN split (HAM10000_split/train); augmentation is on-the-fly
         - val_data_dir = raw VAL split, used only for best-model / early-stop / LR step
         - test_data_dir = raw TEST split, evaluated exactly once at the end
+        - sampler_mode = 'sqrt' (1/sqrt(count), default) | 'inverse' (1/count) | 'none' (plain shuffle)
         """
         self.data_dir = data_dir
         self.val_data_dir = val_data_dir
@@ -39,6 +40,7 @@ class EfficientNetB4GradualUnfreezingTrainer:
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
+        self.sampler_mode = sampler_mode
         self.num_classes = 7
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.class_names = ['NV', 'MEL', 'BKL', 'BCC', 'AKIEC', 'VASC', 'DF']
@@ -49,10 +51,18 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print("="*60)
         
     def create_dataloaders(self):
-        """Train on the augmented train split; early-stopping on raw val; final eval on raw test."""
+        """Train on the raw train split with on-the-fly augmentation; early-stop on raw val; final eval on raw test."""
         # EfficientNetB4 optimal input size is 380x380, but using 224x224 for consistency
+        # Train: on-the-fly augmentation, conservative geometric only (no vertical flip, no black fill)
         train_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((256, 256)),
+            transforms.RandomResizedCrop(
+                224,
+                scale=(0.9, 1.0),
+                ratio=(0.95, 1.05)
+            ),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(15),
             transforms.ToTensor(),
         ])
         
@@ -75,7 +85,25 @@ class EfficientNetB4GradualUnfreezingTrainer:
                     f"Train/{name} class folders differ: {self.class_names} vs {ds.classes}"
                 )
         
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        # Moderated class-balanced sampling (WeightedRandomSampler replaces shuffle)
+        class_counts = np.bincount(train_dataset.targets, minlength=self.num_classes)
+        if self.sampler_mode == 'sqrt':
+            class_weights = 1.0 / np.sqrt(class_counts)
+        elif self.sampler_mode == 'inverse':
+            class_weights = 1.0 / class_counts
+        elif self.sampler_mode == 'none':
+            class_weights = None
+        else:
+            raise ValueError(f"Unknown sampler_mode: {self.sampler_mode}")
+        
+        if class_weights is not None:
+            sample_weights = np.array([class_weights[t] for t in train_dataset.targets])
+            train_sampler = WeightedRandomSampler(
+                sample_weights, num_samples=len(train_dataset), replacement=True
+            )
+            train_loader = DataLoader(train_dataset, batch_size=self.batch_size, sampler=train_sampler, num_workers=4, pin_memory=True)
+        else:
+            train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4, pin_memory=True)
         test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4, pin_memory=True)
         
@@ -83,6 +111,10 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print(f"Validation samples: {len(val_dataset)}")
         print(f"Test samples: {len(test_dataset)}")
         print(f"Classes (ImageFolder order): {self.class_names}")
+        print(f"Train class counts: {dict(zip(self.class_names, class_counts))}")
+        if class_weights is not None:
+            print(f"Sampler mode: {self.sampler_mode} (relative weights: "
+                  f"{dict(zip(self.class_names, (class_weights / class_weights.min()).round(2)))})")
         
         return train_loader, val_loader, test_loader
     
@@ -704,9 +736,10 @@ class EfficientNetB4GradualUnfreezingTrainer:
 
 if __name__ == "__main__":
     trainer = EfficientNetB4GradualUnfreezingTrainer(
-        data_dir='HAM10K_augmented_dataset',
+        data_dir='HAM10000_split/train',
         batch_size=64,
         num_epochs=50,
-        learning_rate=0.001
+        learning_rate=0.001,
+        sampler_mode='sqrt'
     )
     model, history, metrics = trainer.train()
