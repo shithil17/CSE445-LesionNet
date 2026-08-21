@@ -1,0 +1,53 @@
+{
+  "metadata_schema_version": 3,
+  "age_median": 50.0,
+  "age_mean": 51.94571389004293,
+  "age_std": 16.82926935018938,
+  "sex_categories": [
+    "female",
+    "male",
+    "unknown"
+  ],
+  "localization_categories": [
+    "abdomen",
+    "acral",
+    "back",
+    "chest",
+    "ear",
+    "face",
+    "foot",
+    "genital",
+    "hand",
+    "lower extremity",
+    "neck",
+    "scalp",
+    "trunk",
+    "unknown",
+    "upper extremity"
+  ],
+  "feature_names": [
+    "age_scaled",
+    "age_missing",
+    "sex_female",
+    "sex_male",
+    "sex_unknown",
+    "sex_missing",
+    "localization_abdomen",
+    "localization_acral",
+    "localization_back",
+    "localization_chest",
+    "localization_ear",
+    "localization_face",
+    "localization_foot",
+    "localization_genital",
+    "localization_hand",
+    "localization_lower extremity",
+    "localization_neck",
+    "localization_scalp",
+    "localization_trunk",
+    "localization_unknown",
+    "localization_upper extremity",
+    "localization_missing"
+  ],
+  "dim": 22
+}
