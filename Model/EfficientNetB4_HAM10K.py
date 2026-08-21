@@ -18,6 +18,7 @@ from sklearn.metrics import (
 )
 import numpy as np
 import os
+import glob
 import random
 import time
 from tqdm import tqdm
@@ -60,12 +61,14 @@ class FocalLoss(nn.Module):
 
 
 class EfficientNetB4GradualUnfreezingTrainer:
-    def __init__(self, data_dir, val_data_dir='HAM10000_split/val', test_data_dir='HAM10000_split/test', batch_size=None, num_epochs=50, learning_rate=0.001, image_size=380, seed=42, imbalance_strategy='focal', sampler_mode='sqrt', loss_mode='weighted_ce', focal_gamma=2.0, grad_accum_steps=1, weight_decay=1e-4, label_smoothing=0.05, resume_checkpoint=None, early_stop_patience=7):
+    def __init__(self, data_dir, val_data_dir='HAM10000_split/val', test_data_dir='HAM10000_split/test', batch_size=None, num_epochs=50, learning_rate=0.001, image_size=380, seed=42, imbalance_strategy='focal', sampler_mode='sqrt', loss_mode='weighted_ce', focal_gamma=2.0, grad_accum_steps=1, weight_decay=1e-4, label_smoothing=0.05, resume_checkpoint=None, early_stop_patience=7, stage2_unfreeze_patience=4, use_tta=True, use_ensemble=True, keep_top_k_checkpoints=3):
         """
         EfficientNetB4 with gradual unfreezing:
         - Epochs 1-4: Train only head (frozen backbone)
         - Epoch 5: Unfreeze blocks 6, 7, 8 (deepest blocks)
-        - Epoch 25: Unfreeze blocks 4, 5 (image_size 380 needs smaller batch to fit on ~6 GB GPU)
+        - Blocks 4-5: unfrozen only after stage2_unfreeze_patience epochs without a val
+          Macro-F1 improvement (plateau-gated, not a fixed epoch), with BatchNorm running
+          stats pinned to eval mode for those blocks (small-batch stabilizer)
         - data_dir = raw TRAIN split (HAM10000_split/train); augmentation is on-the-fly
         - val_data_dir = raw VAL split, used only for best-model / early-stop / LR step
         - test_data_dir = raw TEST split, evaluated exactly once at the end
@@ -85,6 +88,15 @@ class EfficientNetB4GradualUnfreezingTrainer:
         - label_smoothing = CE smoothing (focal loss skips it; see FocalLoss TODO)
         - resume_checkpoint = path to efficientnetb4_last_checkpoint.pth to resume from, or None for a fresh run
         - early_stop_patience = epochs without validation Macro-F1 improvement before stopping
+        - stage2_unfreeze_patience = epochs without val Macro-F1 improvement that must pass
+          before blocks 4-5 unfreeze fires (plateau-gated; default 4, fires at most once)
+        - use_tta = average softmax over augmented views (flip/±5° rotation) for the final
+          test-set evaluation, and print the no-TTA → TTA delta (default True)
+        - use_ensemble = after training, average the top-K best checkpoints' softmax
+          probabilities on the test set and report ensemble metrics (default True)
+        - keep_top_k_checkpoints = how many best checkpoints to keep for the ensemble
+          (default 3); the single best is always also saved to
+          efficientnetb4_best_model.pth for resume/tooling compatibility
         """
         if loss_mode not in ('ce', 'weighted_ce'):
             raise ValueError(
@@ -116,13 +128,30 @@ class EfficientNetB4GradualUnfreezingTrainer:
         self.label_smoothing = label_smoothing
         self.resume_checkpoint = resume_checkpoint
         self.early_stop_patience = early_stop_patience
+        if stage2_unfreeze_patience < 1:
+            raise ValueError(
+                f"stage2_unfreeze_patience must be >= 1, got {stage2_unfreeze_patience}."
+            )
+        if keep_top_k_checkpoints < 1:
+            raise ValueError(
+                f"keep_top_k_checkpoints must be >= 1, got {keep_top_k_checkpoints}."
+            )
+        self.stage2_unfreeze_patience = stage2_unfreeze_patience
+        self.use_tta = use_tta
+        self.use_ensemble = use_ensemble
+        self.keep_top_k_checkpoints = keep_top_k_checkpoints
+        self._stage2_unfrozen = False
+        self._stage2_epoch = None
+        self._stage2_best_epoch = None
+        self._frozen_bn_modules = []
+        self._best_checkpoints = []
         self.num_classes = 7
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.class_names = ['NV', 'MEL', 'BKL', 'BCC', 'AKIEC', 'VASC', 'DF']
 
         print(f"Using device: {self.device}")
         print("="*60)
-        print("EfficientNetB4 with Gradual Unfreezing (Blocks 6-8 @ epoch 5; blocks 4-5 @ epoch 25)")
+        print("EfficientNetB4 with Gradual Unfreezing (Blocks 6-8 @ epoch 5; blocks 4-5 plateau-gated)")
         print("="*60)
         print(f"Image size: {self.image_size}x{self.image_size}")
         print(f"Random seed: {self.seed}")
@@ -130,7 +159,7 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print(f"Loss mode: {self.loss_mode}")
         print(f"Sampler mode: {self.sampler_mode}")
         print(f"Model selection: Macro-F1")
-        print(f"Blocks 4-5 unfreezing: epoch 25")
+        print(f"Blocks 4-5 unfreezing: plateau-gated (patience {self.stage2_unfreeze_patience}) with BN running stats frozen")
         print(f"Resume: {self.resume_checkpoint}")
         print("="*60)
 
@@ -254,23 +283,38 @@ class EfficientNetB4GradualUnfreezingTrainer:
 
         return model
 
-    def unfreeze_blocks(self, model, block_indices, optimizer, lr_factor=0.1):
+    def unfreeze_blocks(self, model, block_indices, optimizer, lr_factor=0.1, freeze_bn=False):
         """
         Unfreeze specific EfficientNet blocks and add to optimizer
         block_indices: list of block numbers to unfreeze (e.g., [29, 30, 31])
+        freeze_bn: also pin BatchNorm running stats in those blocks to eval mode —
+        affine weight/bias stays trainable (requires_grad=True as set by the param
+        loop) but running_mean/running_var stop updating. Those modules are recorded
+        in self._frozen_bn_modules so train_epoch() can re-apply eval mode after
+        every model.train() call.
         """
         parameters_to_add = []
         unfrozen_count = 0
+        block_prefixes = [f'features.{idx}.' for idx in block_indices]  # EfficientNet blocks are in features.{index}
 
         for name, param in model.named_parameters():
             # Check if parameter belongs to any of the specified blocks
-            for block_idx in block_indices:
-                block_name = f'features.{block_idx}.'  # EfficientNet blocks are in features.{index}
-                if block_name in name:
+            for prefix in block_prefixes:
+                if prefix in name:
                     param.requires_grad = True
                     parameters_to_add.append(param)
                     unfrozen_count += param.numel()
                     break
+
+        if freeze_bn:
+            for name, module in model.named_modules():
+                if isinstance(module, nn.BatchNorm2d) and any(name.startswith(p) for p in block_prefixes):
+                    module.eval()
+                    if module not in self._frozen_bn_modules:
+                        self._frozen_bn_modules.append(module)
+            if self._frozen_bn_modules:
+                print(f"   → BatchNorm running stats frozen in blocks {block_indices} "
+                      f"(eval mode; affine params still trainable)")
 
         if parameters_to_add:
             optimizer.add_param_group({
@@ -313,6 +357,10 @@ class EfficientNetB4GradualUnfreezingTrainer:
     def train_epoch(self, model, train_loader, criterion, optimizer, epoch):
         """Train for one epoch"""
         model.train()
+        # Blocks unfrozen with freeze_bn=True must never flip back to train mode:
+        # their BatchNorm running stats are pinned by keeping those modules in eval().
+        for bn in self._frozen_bn_modules:
+            bn.eval()
         running_loss = 0.0
         correct = 0
         total = 0
@@ -393,6 +441,118 @@ class EfficientNetB4GradualUnfreezingTrainer:
             np.array(all_targets),
             np.array(all_probs)
         )
+
+    def predict_with_tta(self, model, loader, n_augments=4):
+        """Test-time augmentation for the final test-set evaluation: run each image
+        through n_augments deterministic views (identity, horizontal flip, ±5°
+        rotation, optionally a 0.95-scale center crop) and average the softmax
+        probabilities (not logits) across views. Returns (avg_probs, targets).
+
+        Per-epoch val checks keep using validate() — TTA is final-eval-only here.
+        """
+        model.eval()
+        n_augments = max(1, min(n_augments, 5))
+        all_avg_probs = []
+        all_targets = []
+        crop_size = int(self.image_size * 0.95)
+        crop_offset = (self.image_size - crop_size) // 2
+
+        pbar = tqdm(loader, desc="Test (TTA)", leave=False, ncols=100)
+        with torch.no_grad():
+            for data, target in pbar:
+                data, target = data.to(self.device), target.to(self.device)
+                probs_sum = None
+                for aug_idx in range(n_augments):
+                    variant = data
+                    if aug_idx == 1:
+                        variant = torch.flip(data, dims=[3])
+                    elif aug_idx == 2:
+                        variant = transforms.functional.rotate(data, 5)
+                    elif aug_idx == 3:
+                        variant = transforms.functional.rotate(data, -5)
+                    elif aug_idx == 4:
+                        variant = transforms.functional.resized_crop(
+                            data, crop_offset, crop_offset, crop_size, crop_size,
+                            (self.image_size, self.image_size))
+                    probs = torch.softmax(model(variant), dim=1)
+                    probs_sum = probs if probs_sum is None else probs_sum + probs
+                all_avg_probs.append((probs_sum / n_augments).cpu().numpy())
+                all_targets.extend(target.cpu().numpy())
+        return np.concatenate(all_avg_probs, axis=0), np.array(all_targets)
+
+    def _trim_checkpoints(self):
+        """Keep only the top-K best checkpoints (by val Macro-F1); delete worse ones
+        from disk so the rotation never grows unbounded."""
+        keep = max(1, self.keep_top_k_checkpoints)
+        entries = sorted(self._best_checkpoints, key=lambda e: e['f1'], reverse=True)
+        for entry in entries[keep:]:
+            if os.path.exists(entry['path']):
+                os.remove(entry['path'])
+                print(f"   → Removed {entry['path']} (outside top-{keep})")
+        self._best_checkpoints = entries[:keep]
+
+    def _rescan_checkpoints(self):
+        """Rebuild the top-K list from the epoch-named best checkpoints found on disk
+        (resume path: the in-memory list is not persisted in old checkpoints)."""
+        entries = []
+        for path in sorted(glob.glob('efficientnetb4_best_model_epoch*.pth')):
+            try:
+                ckpt = torch.load(path, map_location='cpu', weights_only=False)
+            except Exception:
+                continue
+            entries.append({
+                'path': path,
+                'f1': ckpt.get('best_macro_f1', -1.0),
+                'epoch': ckpt.get('epoch', -1),
+            })
+        entries.sort(key=lambda e: e['f1'], reverse=True)
+        self._best_checkpoints = entries[:max(1, self.keep_top_k_checkpoints)]
+
+    def evaluate_ensemble(self, test_loader, criterion=None):
+        """Load the top-K saved best checkpoints, run each through predict_with_tta
+        (or plain validate when use_tta=False) on the test set, average their softmax
+        probabilities across checkpoints, and report ensemble Macro-F1 / balanced
+        accuracy alongside the single-best-model numbers."""
+        paths = [e['path'] for e in self._best_checkpoints]
+        if not paths:
+            print("\nNo top-K best checkpoints available — skipping ensemble evaluation.")
+            return None
+
+        print("\n" + "=" * 60)
+        print("ENSEMBLE EVALUATION (top-K best checkpoints)")
+        print("=" * 60)
+        model = self.build_model()
+        probs_sum = None
+        targets = None
+        loaded = 0
+        for i, entry in enumerate(self._best_checkpoints, start=1):
+            path = entry['path']
+            if not os.path.exists(path):
+                continue
+            checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            member_epoch = checkpoint['epoch']
+            member_f1 = checkpoint['best_macro_f1']
+            if self.use_tta:
+                probs, targets = self.predict_with_tta(model, test_loader, n_augments=4)
+            else:
+                _, _, _, targets, probs = self.validate(model, test_loader, criterion, member_epoch - 1)
+            probs_sum = probs if probs_sum is None else probs_sum + probs
+            loaded += 1
+            print(f"  member {i}/{len(paths)}: {path} (val Macro-F1 {member_f1:.4f} @ epoch {member_epoch})")
+
+        if probs_sum is None:
+            print("  No ensemble members could be loaded — skipping.")
+            return None
+
+        avg_probs = probs_sum / loaded
+        preds = avg_probs.argmax(axis=1)
+        ens_f1 = f1_score(targets, preds, average='macro', zero_division=0)
+        ens_bacc = balanced_accuracy_score(targets, preds)
+        print(f"\n  ENSEMBLE Macro-F1: {ens_f1:.4f} | Balanced accuracy: {ens_bacc:.4f} "
+              f"({loaded} members)")
+        print("=" * 60)
+        return {'macro_f1': ens_f1, 'balanced_accuracy': ens_bacc, 'paths': paths}
 
     def plot_training_curves(self, history):
         """Plot and save training curves"""
@@ -616,6 +776,14 @@ class EfficientNetB4GradualUnfreezingTrainer:
         # (The resume path below restores saved RNG state instead.)
         set_seed(self.seed)
 
+        if self.resume_checkpoint is None:
+            # Fresh run: clear stale epoch-named best checkpoints from any previous
+            # experiment so the top-K rotation/ensemble only ever covers this run.
+            for stale in glob.glob('efficientnetb4_best_model_epoch*.pth'):
+                os.remove(stale)
+                print(f"   → Removed stale best checkpoint from a previous run: {stale}")
+            self._best_checkpoints = []
+
         train_loader, val_loader, test_loader = self.create_dataloaders()
         model = self.build_model()
         criterion = self._build_criterion()
@@ -647,7 +815,10 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print(f"\nGradual unfreezing:")
         print(f"    Head: epochs 1-4")
         print(f"    Blocks 6-8: epoch 5+")
-        print(f"    Blocks 4-5: epoch 25+")
+        print(f"    Blocks 4-5: plateau-gated — fires once after {self.stage2_unfreeze_patience} epochs "
+              f"without a val Macro-F1 improvement (BatchNorm running stats frozen)")
+        print(f"Final test evaluation: TTA {'on' if self.use_tta else 'off'} | "
+              f"Top-{self.keep_top_k_checkpoints} ensemble {'on' if self.use_ensemble else 'off'}")
         print(f"\nCheckpoint:")
         print(f"    Best: efficientnetb4_best_model.pth")
         print(f"    Resume: efficientnetb4_last_checkpoint.pth")
@@ -717,11 +888,16 @@ class EfficientNetB4GradualUnfreezingTrainer:
                 # Blocks 6-8 were already unfrozen when this checkpoint was saved; re-apply the
                 # unfreeze so the optimizer param-group layout matches before state restore.
                 self.unfreeze_blocks(model, [6, 7, 8], optimizer, lr_factor=0.1)
-            if checkpoint['epoch'] > 25:
-                # Blocks 4-5 were unfrozen at epoch 26 (loop index 25); re-apply so param-group
-                # layout matches. A checkpoint at exactly epoch 25 still has 2 groups and the
-                # resumed run's own epoch-26 unfreeze fires normally.
-                self.unfreeze_blocks(model, [4, 5], optimizer, lr_factor=0.1)
+            # Stage-2 state: old checkpoints (pre-plateau-gating) fired at saved epoch > 25;
+            # new checkpoints persist the flag directly.
+            self._stage2_unfrozen = checkpoint.get('stage2_unfrozen', checkpoint['epoch'] > 25)
+            self._stage2_epoch = checkpoint.get('stage2_epoch')
+            self._stage2_best_epoch = checkpoint.get('stage2_best_epoch')
+            self._best_checkpoints = checkpoint.get('best_checkpoints', [])
+            if self._stage2_unfrozen:
+                # Re-apply so the optimizer param-group layout (and frozen-BN eval mode)
+                # matches before state restore.
+                self.unfreeze_blocks(model, [4, 5], optimizer, lr_factor=0.1, freeze_bn=True)
 
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -748,6 +924,10 @@ class EfficientNetB4GradualUnfreezingTrainer:
 
             start_epoch = checkpoint['epoch']  # next epoch to run (0-indexed)
 
+            # Rebuild the top-K list from disk: the in-memory list is not persisted
+            # in older checkpoints and files may have been trimmed externally.
+            self._rescan_checkpoints()
+
             print("=" * 60)
             print("RESUMING TRAINING")
             print("=" * 60)
@@ -765,7 +945,8 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print("=" * 60)
         print(f"Epochs 1-4:   Train head only")
         print(f"Epochs 5+:    Train head + blocks 6-8 (unfrozen at epoch 5)")
-        print(f"Epochs 25+:   Train head + blocks 4-8 (unfrozen at epoch 25; batch size {self.batch_size})")
+        print(f"Blocks 4-5:   Train head + blocks 4-8 once {self.stage2_unfreeze_patience} epochs pass "
+              f"without a val Macro-F1 improvement (BN running stats frozen; batch size {self.batch_size})")
         print("=" * 60)
 
         start_time = time.time()
@@ -778,10 +959,19 @@ class EfficientNetB4GradualUnfreezingTrainer:
                 # Unfreeze blocks 6, 7, 8 (deepest blocks)
                 self.unfreeze_blocks(model, [6, 7, 8], optimizer, lr_factor=0.1)
 
-            if epoch == 25:
-                print(f"\n🔓 UNFREEZING blocks 4-5 at epoch {epoch+1}...")
-                # Unfreeze blocks 4, 5
-                self.unfreeze_blocks(model, [4, 5], optimizer, lr_factor=0.1)
+            if (not self._stage2_unfrozen and epoch > 5
+                    and patience_counter >= self.stage2_unfreeze_patience):
+                # Blocks 4-5 unfreeze is plateau-gated, not epoch-gated: it fires once,
+                # only after blocks 6-8 have had room to help, and only once val Macro-F1
+                # has gone stage2_unfreeze_patience epochs without improving. BatchNorm
+                # running stats inside these blocks are pinned to eval mode (small-batch
+                # stabilizer) — affine params stay trainable.
+                print(f"\n🔓 UNFREEZING blocks 4-5 at epoch {epoch+1} "
+                      f"(no val Macro-F1 improvement for {patience_counter} epochs)...")
+                self._stage2_unfrozen = True
+                self._stage2_epoch = epoch + 1
+                self._stage2_best_epoch = best_epoch
+                self.unfreeze_blocks(model, [4, 5], optimizer, lr_factor=0.1, freeze_bn=True)
 
             # Training
             train_loss, train_acc = self.train_epoch(model, train_loader, criterion, optimizer, epoch)
@@ -823,13 +1013,22 @@ class EfficientNetB4GradualUnfreezingTrainer:
                 best_epoch = epoch + 1
                 patience_counter = 0
 
-                torch.save({
+                best_state = {
                     'model_state_dict': model.state_dict(),
                     'epoch': best_epoch,
                     'best_macro_f1': best_macro_f1,
                     'best_val_accuracy': best_val_acc,
                     'best_val_loss': val_loss,
-                }, 'efficientnetb4_best_model.pth')
+                }
+                # Rotating top-K filenames: keep the best K by Macro-F1 on disk for the
+                # ensemble, delete worse ones. The canonical unqualified filename is kept
+                # as a copy of the single best so resume/external tooling is unaffected.
+                rotating_path = f'efficientnetb4_best_model_epoch{best_epoch}.pth'
+                torch.save(best_state, rotating_path)
+                self._best_checkpoints = [e for e in self._best_checkpoints if e['path'] != rotating_path]
+                self._best_checkpoints.append({'path': rotating_path, 'f1': best_macro_f1, 'epoch': best_epoch})
+                self._trim_checkpoints()
+                torch.save(best_state, 'efficientnetb4_best_model.pth')
 
                 print(f"💾 SAVING MODEL → Epoch {epoch+1} | New Best Macro F1: {best_macro_f1:.4f} (+{improvement:.4f}) | Acc: {best_val_acc:.2f}%")
                 self.plot_confusion_matrix(val_targets, val_preds, epoch + 1)
@@ -856,6 +1055,10 @@ class EfficientNetB4GradualUnfreezingTrainer:
                 'loss_mode': self.loss_mode,
                 'sampler_mode': self.sampler_mode,
                 'imbalance_strategy': self.imbalance_strategy,
+                'stage2_unfrozen': self._stage2_unfrozen,
+                'stage2_epoch': self._stage2_epoch,
+                'stage2_best_epoch': self._stage2_best_epoch,
+                'best_checkpoints': self._best_checkpoints,
             }, 'efficientnetb4_last_checkpoint.pth')
 
             # ===== TRAINING METRICS (updated at the end of every completed epoch) =====
@@ -876,6 +1079,13 @@ class EfficientNetB4GradualUnfreezingTrainer:
 
         total_training_time = time.time() - start_time
 
+        # ===== STAGE-2 ROLLBACK NOTE (informational only) =====
+        if (self._stage2_unfrozen and self._stage2_epoch is not None
+                and best_epoch is not None and best_epoch < self._stage2_epoch):
+            print(f"\nℹ️ STAGE-2 NOTE: the blocks 4-5 unfreeze (epoch {self._stage2_epoch}) did not help "
+                  f"this run — the best epoch ({best_epoch}) predates it. The best-checkpoint "
+                  f"mechanism keeps the saved model unaffected.")
+
         # ===== FINAL RESULTS =====
         print("\n" + "=" * 60)
         print("🏁 TRAINING COMPLETED")
@@ -892,7 +1102,21 @@ class EfficientNetB4GradualUnfreezingTrainer:
         model.load_state_dict(best_checkpoint['model_state_dict'])
         best_epoch = best_checkpoint['epoch']
 
-        final_loss, final_acc, final_preds, final_targets, final_probs = self.validate(model, test_loader, criterion, best_epoch - 1)
+        # Run the no-TTA baseline first so the TTA delta is visible, not silently swapped in.
+        final_loss, no_tta_acc, no_tta_preds, no_tta_targets, no_tta_probs = self.validate(
+            model, test_loader, criterion, best_epoch - 1)
+        no_tta_f1 = f1_score(no_tta_preds, no_tta_targets, average='macro', zero_division=0)
+
+        if self.use_tta:
+            final_probs, final_targets = self.predict_with_tta(model, test_loader, n_augments=4)
+            final_preds = final_probs.argmax(axis=1)
+            final_acc = 100.0 * float((final_preds == final_targets).mean())
+            tta_f1 = f1_score(final_preds, final_targets, average='macro', zero_division=0)
+            print(f"\nTest Macro-F1: no-TTA {no_tta_f1:.4f} → TTA {tta_f1:.4f}")
+        else:
+            final_preds, final_targets, final_probs = no_tta_preds, no_tta_targets, no_tta_probs
+            final_acc = no_tta_acc
+            tta_f1 = no_tta_f1
 
         # Plot training curves + training diagnostics
         self.plot_training_curves(history)
@@ -1014,6 +1238,11 @@ class EfficientNetB4GradualUnfreezingTrainer:
                   f"{specificity_per_class[class_name]:<12.4f} {m['f1-score']:<12.4f} "
                   f"{roc_auc_per_class[class_name]:<10.4f} {pr_auc_per_class[class_name]:<10.4f}")
 
+        # ===== ENSEMBLE EVALUATION (top-K best checkpoints) =====
+        ensemble_result = None
+        if self.use_ensemble:
+            ensemble_result = self.evaluate_ensemble(test_loader, criterion)
+
         # ===== EXACT CONFIGURATION USED (reproducibility recap) =====
         print("\n" + "=" * 60)
         print("EXPERIMENT CONFIGURATION (as run)")
@@ -1024,11 +1253,46 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print(f"Batch size: {self.batch_size} | Grad accum: {self.grad_accum_steps} (effective batch {self.batch_size * self.grad_accum_steps}) | Learning rate: {self.learning_rate} | Max epochs: {self.num_epochs}")
         print(f"Optimizer: AdamW (weight_decay={self.weight_decay}) | Scheduler: ReduceLROnPlateau(factor=0.5, patience=5, min_lr=1e-7) on val Macro-F1 (mode='max')")
         print(f"Imbalance strategy: {self.imbalance_strategy} (loss_mode={self.loss_mode}, sampler_mode={self.sampler_mode}) | Label smoothing: {self.label_smoothing}")
-        print(f"Unfreezing: head (epochs 1-4) → +blocks 6-8 (epoch 5+) → +blocks 4-5 (epoch 25+)")
+        print(f"Unfreezing: head (epochs 1-4) → +blocks 6-8 (epoch 5+) → +blocks 4-5 "
+              f"(plateau-gated: {self.stage2_unfreeze_patience} epochs without val Macro-F1 "
+              f"improvement; BN running stats frozen)")
         print(f"Model selection: Validation Macro-F1 | Early stop patience: {self.early_stop_patience}")
         print(f"Random seed: {self.seed}")
         print(f"Class order: {self.class_names}")
         print(f"Best validation Macro F1: {best_macro_f1:.4f} @ epoch {best_epoch}")
+        print("=" * 60)
+
+        # ===== STAGE COMPARISON (what actually moved the needle) =====
+        print("\n" + "=" * 60)
+        print("STAGE COMPARISON")
+        print("=" * 60)
+        stage2_triggered = self._stage2_unfrozen and self._stage2_epoch is not None
+        if stage2_triggered:
+            pre_f1s = history['val_macro_f1'][:self._stage2_epoch - 1]
+            post_f1s = history['val_macro_f1'][self._stage2_epoch - 1:]
+            if pre_f1s:
+                pre_best_epoch = int(np.argmax(pre_f1s)) + 1
+                pre_best_f1 = float(np.max(pre_f1s))
+            else:
+                pre_best_epoch, pre_best_f1 = 'n/a', 'n/a'
+            if post_f1s:
+                post_best_epoch = int(np.argmax(post_f1s)) + self._stage2_epoch
+                post_best_f1 = float(np.max(post_f1s))
+            else:
+                post_best_epoch, post_best_f1 = 'n/a', 'n/a'
+        else:
+            pre_best_epoch, pre_best_f1 = best_epoch, best_macro_f1
+            post_best_epoch, post_best_f1 = 'not triggered', 'n/a'
+        pre_f1_str = f"{pre_best_f1:.4f}" if isinstance(pre_best_f1, float) else str(pre_best_f1)
+        post_f1_str = f"{post_best_f1:.4f}" if isinstance(post_best_f1, float) else str(post_best_f1)
+        tta_note = "" if self.use_tta else " (TTA off — identical by design)"
+        print(f"  Best epoch (head+blocks6-8 only): {pre_best_epoch}, Macro-F1 {pre_f1_str}")
+        print(f"  Best epoch (+blocks4-5): {post_best_epoch}, Macro-F1 {post_f1_str}")
+        print(f"  TTA delta: {no_tta_f1:.4f} -> {tta_f1:.4f}{tta_note}")
+        if ensemble_result is not None:
+            print(f"  Ensemble (top-K) Macro-F1: {ensemble_result['macro_f1']:.4f}")
+        else:
+            print(f"  Ensemble (top-K) Macro-F1: n/a")
         print("=" * 60)
 
         # ===== SAVE FULL METRICS =====
@@ -1075,6 +1339,16 @@ class EfficientNetB4GradualUnfreezingTrainer:
             'roc_auc_per_class': roc_auc_per_class,
             'pr_auc_per_class': pr_auc_per_class,
             'classification_report': report,
+            # stage-2 unfreeze / TTA / ensemble results
+            'stage2_unfrozen': self._stage2_unfrozen,
+            'stage2_epoch': self._stage2_epoch,
+            'stage2_unfreeze_patience': self.stage2_unfreeze_patience,
+            'no_tta_macro_f1': no_tta_f1,
+            'tta_macro_f1': tta_f1,
+            'use_tta': self.use_tta,
+            'ensemble_macro_f1': ensemble_result['macro_f1'] if ensemble_result else None,
+            'use_ensemble': self.use_ensemble,
+            'keep_top_k_checkpoints': self.keep_top_k_checkpoints,
         }
         torch.save(metrics, 'efficientnetb4_training_metrics.pth')
 
