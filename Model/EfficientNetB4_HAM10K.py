@@ -1,7 +1,9 @@
 """
 EXP-B4-01-NORM-FINETUNE — EfficientNet-B4 fine-tuning experiment on HAM10000.
 
-What changed vs. the previous pipeline (iterations 1-8):
+The training recipe is the KNOWN-GOOD recipe (val Macro-F1 ~0.773, test Macro-F1
+(TTA) ~0.750) restored as the shared baseline for the image-only vs image+metadata
+comparison:
   - Correct ImageNet normalization: mean/std come from the torchvision B4 weights
     metadata (``EfficientNet_B4_Weights.IMAGENET1K_V1.transforms()``), applied
     identically to train / validation / test.
@@ -9,15 +11,16 @@ What changed vs. the previous pipeline (iterations 1-8):
       train: Resize(shorter side) -> RandomResizedCrop(380) -> geometric aug ->
              color aug -> ToTensor -> Normalize
       val/test: Resize(shorter side) -> CenterCrop(380) -> ToTensor -> Normalize
-  - Discriminative learning rates (head 1e-4 / blocks 6-8 1e-5 / blocks 4-5 5e-6)
-    instead of a single aggressive 1e-3.
-  - Fixed, deterministic unfreezing schedule instead of plateau-gated unfreezing:
-      epochs 1-3: head only
-      epochs 4-8: head + blocks 6-8
-      epoch 9+:   head + blocks 4-8
-      blocks 0-3 remain frozen for the entire experiment
-  - Cosine schedule with a short linear warmup (stable across the whole run) instead
-    of ReduceLROnPlateau.
+  - Discriminative learning rates: head 1e-3, blocks 6-8 = head * 0.1 (1e-4),
+    blocks 4-5 = head * 0.05 (5e-5) — the LRs that worked in the 0.66 -> 0.77
+    journey (defaults derived from lr_head, never hardcoded).
+  - ReduceLROnPlateau (mode='max', factor=0.5, patience=5, min_lr=1e-7) on the
+    validation Macro-F1 — the scheduler that produced the known-good results.
+  - Gradual unfreezing: head only (epochs 1-5), + blocks 6-8 fixed at epoch 6
+    (consistently worked), blocks 4-5 plateau-gated (fires once after
+    stage2_unfreeze_patience epochs without a val Macro-F1 improvement, with
+    BatchNorm running stats in those blocks frozen to eval mode). Blocks 0-3 stay
+    frozen for the whole experiment.
   - AMP (fp16 autocast + GradScaler) for the RTX 4050 laptop GPU.
   - Conservative augmentation with the correct ordering (crop/geometric -> color ->
     ToTensor -> Normalize -> optional mild RandomErasing).
@@ -25,9 +28,12 @@ What changed vs. the previous pipeline (iterations 1-8):
     alpha weighting. CE / weighted-CE remain available for later ablations via
     loss_mode; the WeightedRandomSampler path was removed.
   - Checkpoints: best by validation Macro-F1 (primary) AND best by validation
-    accuracy; per-epoch Macro-F1 / accuracy / balanced accuracy / weighted F1.
-  - TTA only for the final test evaluation. Checkpoint ensembling and temperature
-    scaling are disabled for this experiment (calibration is still reported via ECE).
+    accuracy; top-K rotating best checkpoints for the F1-weighted ensemble.
+  - TTA only for the final test evaluation. Temperature scaling (Guo et al.,
+    post-hoc T fit on val logits) and the F1-weighted top-K ensemble (val-gated
+    usage decision) are ON by default — `use_ensemble=False` opt-outs exist.
+  - Opt-in Phase-5 improvements: use_mixup / use_cutmix (soft-target focal),
+    use_multiscale_tta (second-scale TTA at tta_second_scale px).
 
 Metadata fusion experiment (EXP-B4-META-01, opt-in via use_metadata=True):
   - Leakage-safe preprocessing of HAM10000 metadata (age / sex / localization)
@@ -54,8 +60,8 @@ Run from the Model/ directory:
 """
 
 import csv
+import glob
 import json
-import math
 import os
 import random
 import time
@@ -110,6 +116,13 @@ class FocalLoss(nn.Module):
     """FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t), computed from log_softmax.
 
     alpha: optional per-class weights (tensor on the model device); None = unweighted.
+
+    targets may be hard labels (int64 1-D) or soft one-hot mixtures (float 2-D,
+    produced by MixUp/CutMix). For soft targets the focal modulating factor is
+    applied per class with the model's own p_k (the Menghini et al.
+    multi-label-consistent form) and alpha is weighted by the DOMINANT label of
+    each mixed pair — a deliberate simplification of the full
+    multi-label-consistent extension (noted in the code; see forward()).
     """
 
     def __init__(self, gamma=2.0, alpha=None, reduction='mean'):
@@ -120,11 +133,23 @@ class FocalLoss(nn.Module):
 
     def forward(self, logits, targets):
         log_probs = F.log_softmax(logits, dim=1)
-        target_log_probs = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-        p_t = target_log_probs.exp()
-        loss = -(1.0 - p_t) ** self.gamma * target_log_probs
-        if self.alpha is not None:
-            loss = self.alpha[targets] * loss
+        probs = log_probs.exp()
+        if targets.ndim == 1:
+            target_log_probs = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+            p_t = target_log_probs.exp()
+            loss = -(1.0 - p_t) ** self.gamma * target_log_probs
+            if self.alpha is not None:
+                loss = self.alpha[targets] * loss
+        else:
+            # Soft targets (MixUp/CutMix): interpolate the one-hot targets the
+            # same way the images were mixed. Simplification: the focal
+            # modulating factor is applied per class with p_k (multi-label-
+            # consistent form) but the per-class alpha weight comes from the
+            # DOMINANT label in each mixed pair (not the full Menghini et al.
+            # extension) — kept deliberately simple.
+            loss = -((1.0 - probs) ** self.gamma * log_probs * targets).sum(dim=1)
+            if self.alpha is not None:
+                loss = self.alpha[targets.argmax(dim=1)] * loss
         if self.reduction == 'mean':
             return loss.mean()
         return loss.sum()
@@ -361,7 +386,7 @@ class HAM10000Dataset(Dataset):
 
 class EfficientNetB4FinetuneTrainer:
     """EfficientNet-B4 with correct ImageNet preprocessing, aspect-preserving
-    geometry, discriminative LRs and a fixed gradual-unfreezing schedule.
+    geometry, discriminative LRs and gradual unfreezing (restored known-good recipe).
 
     Key arguments (everything else has a sensible default for this experiment):
       - data_dir / val_data_dir / test_data_dir: the lesion-level split folders
@@ -369,14 +394,28 @@ class EfficientNetB4FinetuneTrainer:
       - eval_resize=380: shorter-side resize for val/test before CenterCrop
       - batch_size=16, grad_accum_steps=1 (fallback 8 + 2 keeps effective 16)
       - loss_mode: 'focal' (default) | 'weighted_ce' | 'ce'  (imbalance ablation)
-      - lr_head=1e-4, lr_blocks_6_8=1e-5, lr_blocks_4_5=5e-6: discriminative LRs
-      - warmup_epochs=2, lr_end_factor=0.01: warmup + cosine to ~1e-6 (head)
+      - lr_head=1e-3: peak head LR (the value that worked in the 0.66 -> 0.77
+        journey). lr_blocks_6_8 / lr_blocks_4_5 default to lr_head * 0.1 /
+        lr_head * 0.05 (never hardcoded); pass explicit values to override.
+      - scheduler: ReduceLROnPlateau(mode='max', factor=0.5, patience=5,
+        min_lr=1e-7) on the validation Macro-F1, stepped at the end of each
+        validation phase (no warmup/cosine — that experiment is closed).
+      - Unfreezing: head (epochs 1-5), + blocks 6-8 fixed at epoch 6, blocks 4-5
+        plateau-gated via stage2_unfreeze_patience (default 4) epochs without a
+        val Macro-F1 improvement, fires once, BatchNorm running stats in blocks
+        4-5 frozen to eval mode on firing (affine params stay trainable).
       - use_amp=True: fp16 autocast + GradScaler
       - use_tta=True: TTA only for the final test evaluation
+      - use_ensemble=True: F1-weighted averaging of the top-K best checkpoints;
+        used on the test set only if it beats the single best model on VALIDATION
+        (the decision never looks at test data). keep_top_k_checkpoints (default 3).
       - resume_checkpoint: efficientnetb4_last_checkpoint.pth path or None
       - use_metadata=False: image-only baseline (EXP-B4-01-NORM-FINETUNE).
         True -> image + metadata fusion (EXP-B4-META-01): HAM10000 metadata is
         preprocessed leakage-safely (train-only fit) and fused via a small MLP.
+      - use_mixup / use_cutmix: opt-in Phase-5 augmentation (soft-target focal;
+        both on -> one picked randomly per batch)
+      - use_multiscale_tta: opt-in Phase-5 second-scale TTA (tta_second_scale px)
     """
 
     def __init__(
@@ -394,18 +433,23 @@ class EfficientNetB4FinetuneTrainer:
         loss_mode='focal',
         focal_gamma=2.0,
         weight_decay=1e-4,
-        lr_head=1e-4,
-        lr_blocks_6_8=1e-5,
-        lr_blocks_4_5=5e-6,
-        warmup_epochs=2,
-        lr_end_factor=0.01,
+        lr_head=1e-3,
+        lr_blocks_6_8=None,
+        lr_blocks_4_5=None,
+        stage2_unfreeze_patience=4,
         use_amp=True,
         use_random_erasing=False,
         resume_checkpoint=None,
         early_stop_patience=7,
         use_tta=True,
+        use_ensemble=True,
+        keep_top_k_checkpoints=3,
         use_metadata=False,
         metadata_csv=DEFAULT_METADATA_CSV,
+        use_mixup=False,
+        use_cutmix=False,
+        use_multiscale_tta=False,
+        tta_second_scale=456,
     ):
         if loss_mode not in ('ce', 'weighted_ce', 'focal'):
             raise ValueError(
@@ -418,12 +462,17 @@ class EfficientNetB4FinetuneTrainer:
                 f"eval_resize ({eval_resize}) must be >= image_size ({image_size}) "
                 f"so CenterCrop never fails."
             )
-        if warmup_epochs >= num_epochs:
+        if stage2_unfreeze_patience < 1:
             raise ValueError(
-                f"warmup_epochs ({warmup_epochs}) must be < num_epochs ({num_epochs})."
+                f"stage2_unfreeze_patience must be >= 1, got {stage2_unfreeze_patience}."
             )
-        if not 0.0 < lr_end_factor <= 1.0:
-            raise ValueError(f"lr_end_factor must be in (0, 1], got {lr_end_factor}.")
+        if keep_top_k_checkpoints < 1:
+            raise ValueError(
+                f"keep_top_k_checkpoints must be >= 1, got {keep_top_k_checkpoints}."
+            )
+        if use_mixup and use_cutmix:
+            print("NOTE: both use_mixup and use_cutmix are enabled — one is picked "
+                  "randomly per batch (standard practice).")
 
         self.data_dir = data_dir
         self.val_data_dir = val_data_dir
@@ -443,15 +492,25 @@ class EfficientNetB4FinetuneTrainer:
         self.focal_gamma = focal_gamma
         self.weight_decay = weight_decay
         self.lr_head = lr_head
-        self.lr_blocks_6_8 = lr_blocks_6_8
-        self.lr_blocks_4_5 = lr_blocks_4_5
-        self.warmup_epochs = warmup_epochs
-        self.lr_end_factor = lr_end_factor
+        self.lr_blocks_6_8 = lr_blocks_6_8 if lr_blocks_6_8 is not None else lr_head * 0.1
+        self.lr_blocks_4_5 = lr_blocks_4_5 if lr_blocks_4_5 is not None else lr_head * 0.05
+        self.stage2_unfreeze_patience = stage2_unfreeze_patience
         self.use_amp = use_amp and torch.cuda.is_available()
         self.use_random_erasing = use_random_erasing
         self.resume_checkpoint = resume_checkpoint
         self.early_stop_patience = early_stop_patience
         self.use_tta = use_tta
+        self.use_ensemble = use_ensemble
+        self.keep_top_k_checkpoints = keep_top_k_checkpoints
+        self.use_mixup = use_mixup
+        self.use_cutmix = use_cutmix
+        self.use_multiscale_tta = use_multiscale_tta
+        self.tta_second_scale = tta_second_scale
+
+        self._stage2_unfrozen = False
+        self._stage2_epoch = None
+        self._frozen_bn_modules = []
+        self._best_checkpoints = []
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
@@ -745,12 +804,16 @@ class EfficientNetB4FinetuneTrainer:
         ]
 
     def _set_trainable(self, model, epoch_idx):
-        """Apply the fixed unfreezing schedule for a 0-based epoch index.
+        """Apply the current trainable stage for a 0-based epoch index.
 
-        epochs 1-3 (idx 0-2): classifier/head only
-        epochs 4-8 (idx 3-7): classifier + blocks 6-8
-        epoch 9+   (idx 8+):  classifier + blocks 4-8
-        blocks 0-3 (features.0-3) stay frozen for the entire experiment.
+        Head (classifier + metadata MLP): always trainable.
+        Blocks 6-8: fixed unfreeze at 1-based epoch 6 (0-based idx 5) — this fixed
+        epoch consistently worked, so it stays fixed.
+        Blocks 4-5: trainable only once the plateau-gated stage-2 unfreeze has
+        fired (self._stage2_unfrozen, set in train()); on firing, BatchNorm
+        running stats in those blocks are pinned to eval mode (see
+        _freeze_bn_stats / train_epoch).
+        Blocks 0-3 stay frozen for the entire experiment.
 
         The optimizer param groups are created once up front; groups whose stage
         has not started simply have requires_grad=False, so AdamW never updates
@@ -764,12 +827,28 @@ class EfficientNetB4FinetuneTrainer:
         if self.use_metadata:
             for param in model.metadata_mlp.parameters():
                 param.requires_grad = True
-        if epoch_idx >= 3:
+        if epoch_idx >= 5:
             for param in self._features_params(model, [6, 7, 8]):
                 param.requires_grad = True
-        if epoch_idx >= 8:
+        if self._stage2_unfrozen:
             for param in self._features_params(model, [4, 5]):
                 param.requires_grad = True
+
+    def _freeze_bn_stats(self, model, block_indices):
+        """Pin BatchNorm running stats in the given blocks to permanent eval mode:
+        affine weight/bias stay trainable (requires_grad set by _set_trainable),
+        but running_mean/running_var stop updating. The modules are recorded in
+        self._frozen_bn_modules so train_epoch() re-applies eval mode after every
+        model.train() call."""
+        prefixes = [f'features.{idx}.' for idx in block_indices]
+        for name, module in model.named_modules():
+            if isinstance(module, nn.BatchNorm2d) and any(
+                    name.startswith(p) for p in prefixes):
+                module.eval()
+                if module not in self._frozen_bn_modules:
+                    self._frozen_bn_modules.append(module)
+        print(f"   -> BatchNorm running stats frozen in blocks {block_indices} "
+              f"(eval mode; affine params still trainable)")
 
     def _build_param_groups(self, model):
         """Explicit optimizer groups: classifier (+ metadata MLP in metadata mode)
@@ -801,18 +880,13 @@ class EfficientNetB4FinetuneTrainer:
         ]
 
     def _build_scheduler(self, optimizer):
-        """One scheduler for the whole run (stable across unfreeze stages):
-        linear warmup for warmup_epochs epochs, then cosine decay down to
-        lr_end_factor * base_lr (head: 1e-4 -> 1e-6)."""
-
-        def lr_mult(epoch):
-            if epoch < self.warmup_epochs:
-                return (epoch + 1) / self.warmup_epochs
-            t = (epoch - self.warmup_epochs) / max(1, self.num_epochs - self.warmup_epochs)
-            return (1.0 - self.lr_end_factor) * 0.5 * (1.0 + math.cos(math.pi * t)) \
-                + self.lr_end_factor
-
-        return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_mult)
+        """ReduceLROnPlateau on the validation Macro-F1 (mode='max') — the
+        scheduler from the known-good recipe. Stepped with scheduler.step(
+        val_macro_f1) at the end of each validation phase. The warmup+cosine
+        experiment is closed; nothing else is active here."""
+        return optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-7,
+        )
 
     def _build_criterion(self):
         """Single imbalance mechanism per run. The experiment default is plain
@@ -833,14 +907,61 @@ class EfficientNetB4FinetuneTrainer:
 
     # ------------------------------------------------------------------ train / eval
 
+    @staticmethod
+    def _rand_bbox(size, lam):
+        """CutMix bounding box (Zhang et al., original paper)."""
+        w, h = size[2], size[3]
+        cut_rat = np.sqrt(1.0 - lam)
+        cut_w = int(w * cut_rat)
+        cut_h = int(h * cut_rat)
+        cx = np.random.randint(w)
+        cy = np.random.randint(h)
+        bbx1 = np.clip(cx - cut_w // 2, 0, w)
+        bby1 = np.clip(cy - cut_h // 2, 0, h)
+        bbx2 = np.clip(cx + cut_w // 2, 0, w)
+        bby2 = np.clip(cy + cut_h // 2, 0, h)
+        return bbx1, bby1, bbx2, bby2
+
+    def _mixup_batch(self, data, target):
+        """MixUp (alpha=0.2): convex combination of images AND their one-hot
+        targets. Returns (mixed_data, soft_targets)."""
+        lam = float(np.random.beta(0.2, 0.2))
+        index = torch.randperm(data.size(0), device=data.device)
+        mixed = lam * data + (1 - lam) * data[index]
+        one_hot = F.one_hot(target, self.num_classes).float()
+        soft_targets = lam * one_hot + (1 - lam) * one_hot[index]
+        return mixed, soft_targets
+
+    def _cutmix_batch(self, data, target):
+        """CutMix (alpha=1.0): replace a bounding box in each image with the
+        corresponding patch of a paired image; the one-hot targets are
+        interpolated by the patch area fraction. Returns (mixed_data,
+        soft_targets)."""
+        lam = float(np.random.beta(1.0, 1.0))
+        index = torch.randperm(data.size(0), device=data.device)
+        bbx1, bby1, bbx2, bby2 = self._rand_bbox(data.shape, lam)
+        data = data.clone()
+        data[:, :, bbx1:bbx2, bby1:bby2] = data[index, :, bbx1:bbx2, bby1:bby2]
+        lam = 1.0 - ((bbx2 - bbx1) * (bby2 - bby1) / (data.size(2) * data.size(3)))
+        one_hot = F.one_hot(target, self.num_classes).float()
+        soft_targets = lam * one_hot + (1 - lam) * one_hot[index]
+        return data, soft_targets
+
     def train_epoch(self, model, train_loader, criterion, optimizer):
         """One training epoch with AMP (fp16 autocast + GradScaler) and gradient
         accumulation. Loss is scaled by 1/grad_accum_steps; optimizer.step() fires
-        every grad_accum_steps batches."""
+        every grad_accum_steps batches. Opt-in MixUp/CutMix (use_mixup /
+        use_cutmix) is applied per batch during training only — never to
+        val/test."""
         model.train()
+        # Blocks unfrozen with frozen BN stats must never flip back to train mode:
+        # re-apply eval() to those modules right after every model.train() call.
+        for bn in self._frozen_bn_modules:
+            bn.eval()
         running_loss = 0.0
         correct = 0
         total = 0
+        mixed_batches = 0
 
         pbar = tqdm(train_loader, desc="[Train]", leave=False, ncols=100)
         for batch_idx, batch in enumerate(pbar):
@@ -848,9 +969,20 @@ class EfficientNetB4FinetuneTrainer:
             data, target = data.to(self.device), target.to(self.device)
             metadata = batch[1].to(self.device) if self.use_metadata else None
 
+            soft_target = None
+            if self.use_mixup or self.use_cutmix:
+                # Both enabled -> pick one per batch randomly (standard practice).
+                if self.use_mixup and (not self.use_cutmix or random.random() < 0.5):
+                    data, soft_target = self._mixup_batch(data, target)
+                elif self.use_cutmix:
+                    data, soft_target = self._cutmix_batch(data, target)
+                mixed_batches += 1
+
             with torch.autocast("cuda", dtype=torch.float16, enabled=self.use_amp):
                 output = self._forward(model, data, metadata)
-                loss = criterion(output, target) / self.grad_accum_steps
+                loss = criterion(
+                    output, soft_target if soft_target is not None else target
+                ) / self.grad_accum_steps
 
             self.scaler.scale(loss).backward()
             if (batch_idx + 1) % self.grad_accum_steps == 0:
@@ -861,7 +993,12 @@ class EfficientNetB4FinetuneTrainer:
             running_loss += loss.item()
             _, predicted = torch.max(output.data, 1)
             total += target.size(0)
-            correct += (predicted == target).sum().item()
+            # Mixed batches: the dominant label of the soft target is the
+            # reference for the accuracy display.
+            if soft_target is not None:
+                correct += (predicted == soft_target.argmax(dim=1)).sum().item()
+            else:
+                correct += (predicted == target).sum().item()
 
             current_loss = running_loss / (batch_idx + 1)
             current_acc = 100. * correct / total
@@ -921,23 +1058,31 @@ class EfficientNetB4FinetuneTrainer:
             np.array(all_probs),
         )
 
-    def predict_with_tta(self, model, loader, n_augments=4):
+    def predict_with_tta(self, model, loader, n_augments=4, scales=None):
         """Test-time augmentation — final evaluation only, never per-epoch.
         Runs n_augments deterministic views (identity, horizontal flip, ±5°
-        rotation, optional 0.95-scale center crop), averages the logits across
-        views and applies softmax once. Returns (avg_probs, targets, logits).
+        rotation, optional 0.95-scale center crop) per input scale, averages the
+        LOGITS across views/scales and applies softmax once. scales=None uses
+        [self.image_size]; with use_multiscale_tta the second scale
+        (tta_second_scale px, e.g. 456) is appended so softmax probabilities are
+        averaged across both scales and the augment views.
+
+        Returns (avg_probs, targets, avg_logits) — avg_logits are the
+        TTA-averaged logits (temperature scaling fits/consumes these, keeping
+        the shipped pipeline consistent).
 
         Metadata mode: the metadata embedding is computed ONCE per batch and reused
         across all augmented image views (mathematically equivalent to the full
         forward per view, since the metadata branch is view-independent)."""
         model.eval()
         n_augments = max(1, min(n_augments, 5))
+        if scales is None:
+            scales = [self.image_size]
+            if self.use_multiscale_tta:
+                scales = sorted(set(scales + [self.tta_second_scale]))
         all_avg_probs = []
         all_targets = []
-        all_view_logits = []
-        crop_size = int(self.image_size * 0.95)
-        crop_offset = (self.image_size - crop_size) // 2
-
+        all_avg_logits = []
         pbar = tqdm(loader, desc="[Test TTA]", leave=False, ncols=100)
         with torch.no_grad():
             for batch in pbar:
@@ -947,39 +1092,69 @@ class EfficientNetB4FinetuneTrainer:
                 if self.use_metadata:
                     meta_embedding = model.metadata_mlp(metadata)  # once per sample
                 logits_sum = None
-                view_logits = []
-                for aug_idx in range(n_augments):
-                    variant = data
-                    if aug_idx == 1:
-                        variant = torch.flip(data, dims=[3])
-                    elif aug_idx == 2:
-                        variant = transforms.functional.rotate(data, 5)
-                    elif aug_idx == 3:
-                        variant = transforms.functional.rotate(data, -5)
-                    elif aug_idx == 4:
-                        variant = transforms.functional.resized_crop(
-                            data, crop_offset, crop_offset, crop_size, crop_size,
-                            (self.image_size, self.image_size),
-                        )
-                    with torch.autocast("cuda", dtype=torch.float16, enabled=self.use_amp):
-                        if self.use_metadata:
-                            features = model.features(variant)
-                            features = torch.flatten(model.avgpool(features), 1)
-                            logits = model.classifier(
-                                torch.cat([features, meta_embedding], dim=1))
-                        else:
-                            logits = model(variant)
-                    view_logits.append(logits.cpu().numpy())
-                    logits_sum = logits if logits_sum is None else logits_sum + logits
-                avg_logits = logits_sum / n_augments
+                n_views = 0
+                for scale in scales:
+                    # Keep the 0.95 center crop relative to each input scale.
+                    # At the default scale this is unchanged; at the opt-in
+                    # second scale it avoids accidentally using a much tighter crop.
+                    crop_size = int(scale * 0.95)
+                    crop_offset = (scale - crop_size) // 2
+                    scaled = data
+                    if scale != self.image_size:
+                        scaled = F.interpolate(
+                            scaled, size=(scale, scale), mode='bilinear',
+                            align_corners=False)
+                    for aug_idx in range(n_augments):
+                        variant = scaled
+                        if aug_idx == 1:
+                            variant = torch.flip(scaled, dims=[3])
+                        elif aug_idx == 2:
+                            variant = transforms.functional.rotate(scaled, 5)
+                        elif aug_idx == 3:
+                            variant = transforms.functional.rotate(scaled, -5)
+                        elif aug_idx == 4:
+                            variant = transforms.functional.resized_crop(
+                                scaled, crop_offset, crop_offset, crop_size, crop_size,
+                                (scale, scale),
+                            )
+                        with torch.autocast("cuda", dtype=torch.float16,
+                                            enabled=self.use_amp):
+                            if self.use_metadata:
+                                features = model.features(variant)
+                                features = torch.flatten(model.avgpool(features), 1)
+                                logits = model.classifier(
+                                    torch.cat([features, meta_embedding], dim=1))
+                            else:
+                                logits = model(variant)
+                        logits_sum = logits if logits_sum is None else logits_sum + logits
+                        n_views += 1
+                avg_logits = logits_sum / n_views
                 all_avg_probs.append(torch.softmax(avg_logits.float(), dim=1).cpu().numpy())
-                all_view_logits.append(np.stack(view_logits, axis=1))
+                all_avg_logits.append(avg_logits.float().cpu().numpy())
                 all_targets.extend(target.cpu().numpy())
         return (
             np.concatenate(all_avg_probs, axis=0),
             np.array(all_targets),
-            np.concatenate(all_view_logits, axis=0),
+            np.concatenate(all_avg_logits, axis=0),
         )
+
+    def collect_logits(self, model, loader, epoch_label=""):
+        """Single-pass logits + targets (no TTA, no softmax) on a loader — used
+        for the no-TTA temperature scaling path and ensemble member evaluation."""
+        model.eval()
+        all_logits = []
+        all_targets = []
+        pbar = tqdm(loader, desc=f"[Logits {epoch_label}]", leave=False, ncols=100)
+        with torch.no_grad():
+            for batch in pbar:
+                data, target = batch[0], batch[-1]
+                data, target = data.to(self.device), target.to(self.device)
+                metadata = batch[1].to(self.device) if self.use_metadata else None
+                with torch.autocast("cuda", dtype=torch.float16, enabled=self.use_amp):
+                    output = self._forward(model, data, metadata)
+                all_logits.append(output.float().cpu().numpy())
+                all_targets.extend(target.cpu().numpy())
+        return np.concatenate(all_logits, axis=0), np.array(all_targets)
 
     # ------------------------------------------------------------------ checkpoints
 
@@ -997,18 +1172,187 @@ class EfficientNetB4FinetuneTrainer:
             'model_state_dict': model.state_dict(),
         }
 
+    # ------------------------------------------------------------------ temperature scaling
+
+    @staticmethod
+    def _apply_temperature(logits, temperature):
+        """softmax(logits / T) with the max-subtraction stability trick. Returns
+        probabilities with the same argmax as the unscaled softmax (T > 0 is a
+        strictly monotone transform of the logits — verified at the call site)."""
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature!r}")
+        shifted = (logits - logits.max(axis=1, keepdims=True)) / temperature
+        exp = np.exp(shifted)
+        return exp / exp.sum(axis=1, keepdims=True)
+
+    def fit_temperature(self, model, val_loader, n_augments=4):
+        """Post-hoc temperature scaling (Guo et al.): fit a single scalar T by
+        minimizing CE(logits/T, labels) on the VALIDATION set with LBFGS. When
+        use_tta is on, T is fit on the TTA-averaged logits — the exact pipeline
+        that ships on the test set. Returns the fitted T (float > 0)."""
+        if self.use_tta:
+            _, val_targets, val_logits = self.predict_with_tta(
+                model, val_loader, n_augments=n_augments)
+        else:
+            val_logits, val_targets = self.collect_logits(model, val_loader)
+
+        logits_t = torch.tensor(val_logits, dtype=torch.float32, device=self.device)
+        targets_t = torch.tensor(val_targets, dtype=torch.long, device=self.device)
+        nll = nn.CrossEntropyLoss()
+
+        # Optimize log(T), not T directly, so every LBFGS trial has T > 0.
+        log_temperature = nn.Parameter(
+            torch.log(torch.tensor(1.5, device=self.device)))
+        optimizer = optim.LBFGS([log_temperature], lr=0.01, max_iter=50)
+
+        def closure():
+            optimizer.zero_grad()
+            loss = nll(logits_t / log_temperature.exp(), targets_t)
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        return float(log_temperature.detach().exp().item())
+
+    def fit_temperature_on_probs(self, val_probs, val_targets):
+        """Temperature fit for probability ensembles: minimize CE(softmax(log p /
+        T), labels) on the ensemble's averaged validation probabilities with
+        LBFGS. Used to calibrate the F1-weighted ensemble, which averages member
+        probabilities (not logits)."""
+        log_probs_t = torch.tensor(
+            np.log(np.clip(val_probs, 1e-12, 1.0)), dtype=torch.float32,
+            device=self.device)
+        targets_t = torch.tensor(val_targets, dtype=torch.long, device=self.device)
+        nll = nn.CrossEntropyLoss()
+
+        # As above, parameterize with log(T) to guarantee a positive scalar.
+        log_temperature = nn.Parameter(
+            torch.log(torch.tensor(1.5, device=self.device)))
+        optimizer = optim.LBFGS([log_temperature], lr=0.01, max_iter=50)
+
+        def closure():
+            optimizer.zero_grad()
+            loss = nll(log_probs_t / log_temperature.exp(), targets_t)
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        return float(log_temperature.detach().exp().item())
+
+    @staticmethod
+    def _check_temperature_invariance(unscaled_probs, scaled_probs):
+        """Temperature scaling must change confidence but NEVER change argmax
+        predictions (it is a monotone transform of the logits). Assert it; a
+        violation means the scaling was applied to the wrong quantity."""
+        same = np.array_equal(unscaled_probs.argmax(axis=1), scaled_probs.argmax(axis=1))
+        if not same:
+            raise AssertionError(
+                "temperature scaling changed argmax predictions; "
+                "the scaling pipeline is incompatible with its input representation"
+            )
+        return True
+
+    # ------------------------------------------------------------------ checkpoints / ensemble
+
+    def _trim_checkpoints(self):
+        """Keep only the top-K best checkpoints (by val Macro-F1); delete worse
+        ones from disk so the rotation never grows unbounded."""
+        keep = max(1, self.keep_top_k_checkpoints)
+        entries = sorted(self._best_checkpoints, key=lambda e: e['f1'], reverse=True)
+        for entry in entries[keep:]:
+            if os.path.exists(entry['path']):
+                os.remove(entry['path'])
+                print(f"   -> Removed {entry['path']} (outside top-{keep})")
+        self._best_checkpoints = entries[:keep]
+
+    def _rescan_checkpoints(self):
+        """Rebuild the top-K list from the epoch-named best checkpoints found on
+        disk (resume path: the in-memory list is not persisted in older
+        checkpoints)."""
+        entries = []
+        for path in sorted(glob.glob('efficientnetb4_best_model_epoch*.pth')):
+            try:
+                ckpt = torch.load(path, map_location='cpu', weights_only=False)
+            except Exception:
+                continue
+            entries.append({
+                'path': path,
+                'f1': ckpt.get('best_macro_f1', -1.0),
+                'epoch': ckpt.get('epoch', -1),
+            })
+        entries.sort(key=lambda e: e['f1'], reverse=True)
+        self._best_checkpoints = entries
+        self._trim_checkpoints()
+
+    def _eligible_ensemble_members(self):
+        """Once the blocks-4-5 (stage-2) unfreeze has fired, ensemble membership
+        is restricted to checkpoints saved at/after that epoch — pre-stage-2
+        checkpoints are never eligible for this ensemble."""
+        if not self._stage2_unfrozen or self._stage2_epoch is None:
+            return []
+        return [
+            entry for entry in self._best_checkpoints
+            if entry['epoch'] >= self._stage2_epoch
+        ]
+
+    def _ensemble_probs(self, model, loader, members, criterion, use_tta=True,
+                        n_augments=4):
+        """F1-weighted averaging of member softmax probabilities on `loader`
+        (weights = each member's saved val Macro-F1). Returns (avg_probs, targets,
+        weight_sum). Used on BOTH val (for the usage decision) and test (for the
+        final report) — the decision itself only ever uses the val numbers."""
+        probs_sum = None
+        targets = None
+        weight_sum = 0.0
+        loaded = 0
+        for entry in members:
+            path = entry['path']
+            f1 = float(entry['f1'])
+            if not os.path.exists(path):
+                continue
+            checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            if use_tta:
+                probs, t, _ = self.predict_with_tta(model, loader, n_augments=n_augments)
+            else:
+                _, _, _, t, probs = self.validate(model, loader, criterion,
+                                                  epoch_label="ensemble")
+            weight = max(f1, 1e-6)
+            probs_sum = probs * weight if probs_sum is None else probs_sum + probs * weight
+            weight_sum += weight
+            targets = t
+            loaded += 1
+            print(f"    member {loaded}: {path} (val Macro-F1 {f1:.4f} @ epoch "
+                  f"{checkpoint.get('epoch')}, weight {weight:.4f})")
+        if probs_sum is None:
+            return None, targets, 0.0
+        return probs_sum / weight_sum, targets, weight_sum
+
+    def _score_probs(self, probs, targets):
+        """Macro-F1 / balanced accuracy / accuracy from probabilities."""
+        preds = probs.argmax(axis=1)
+        return {
+            'macro_f1': f1_score(targets, preds, average='macro', zero_division=0),
+            'balanced_acc': balanced_accuracy_score(targets, preds),
+            'accuracy': 100.0 * float((preds == targets).mean()),
+            'preds': preds,
+        }
+
     # ------------------------------------------------------------------ plotting
 
     def plot_training_curves(self, history):
-        """Training curves with the fixed unfreeze boundaries marked (epochs 4 and 9)."""
+        """Training curves with the unfreeze boundaries marked (fixed blocks 6-8
+        at epoch 6, plateau-gated blocks 4-5 at the epoch it actually fired)."""
         epochs = range(1, len(history['train_loss']) + 1)
 
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
 
         ax1.plot(epochs, history['train_acc'], 'b-', label='Training Accuracy')
         ax1.plot(epochs, history['val_acc'], 'r-', label='Validation Accuracy')
-        ax1.axvline(x=4, linestyle='--', color='gray', label='Unfreeze blocks 6-8 (epoch 4)')
-        ax1.axvline(x=9, linestyle='--', color='orange', label='Unfreeze blocks 4-5 (epoch 9)')
+        ax1.axvline(x=6, linestyle='--', color='gray', label='Unfreeze blocks 6-8 (epoch 6)')
+        if self._stage2_epoch is not None:
+            ax1.axvline(x=self._stage2_epoch, linestyle='--', color='orange',
+                        label=f'Unfreeze blocks 4-5 (epoch {self._stage2_epoch})')
         ax1.set_title('Training & Validation Accuracy')
         ax1.set_xlabel('Epoch')
         ax1.set_ylabel('Accuracy (%)')
@@ -1017,8 +1361,9 @@ class EfficientNetB4FinetuneTrainer:
 
         ax2.plot(epochs, history['train_loss'], 'b-', label='Training Loss')
         ax2.plot(epochs, history['val_loss'], 'r-', label='Validation Loss')
-        ax2.axvline(x=4, linestyle='--', color='gray')
-        ax2.axvline(x=9, linestyle='--', color='orange')
+        ax2.axvline(x=6, linestyle='--', color='gray')
+        if self._stage2_epoch is not None:
+            ax2.axvline(x=self._stage2_epoch, linestyle='--', color='orange')
         ax2.set_title('Training & Validation Loss')
         ax2.set_xlabel('Epoch')
         ax2.set_ylabel('Loss')
@@ -1034,8 +1379,9 @@ class EfficientNetB4FinetuneTrainer:
 
         ax4.plot(epochs, history['val_acc'], 'r-', label='Val accuracy')
         ax4.plot(epochs, history['val_macro_f1'], 'm-', label='Val Macro-F1')
-        ax4.axvline(x=4, linestyle='--', color='gray')
-        ax4.axvline(x=9, linestyle='--', color='orange')
+        ax4.axvline(x=6, linestyle='--', color='gray')
+        if self._stage2_epoch is not None:
+            ax4.axvline(x=self._stage2_epoch, linestyle='--', color='orange')
         ax4.set_title('Validation Accuracy & Macro-F1')
         ax4.set_xlabel('Epoch')
         ax4.set_ylabel('Score')
@@ -1157,8 +1503,9 @@ class EfficientNetB4FinetuneTrainer:
         return ece
 
     def plot_calibration_curve(self, y_true, y_pred, probabilities, n_bins=10):
-        """Reliability diagram + ECE (reporting only — temperature scaling is
-        disabled for this experiment)."""
+        """Reliability diagram + ECE. Temperature scaling is applied to the
+        shipped probabilities BEFORE this is called; the reported ECE therefore
+        reflects the calibrated model."""
         confidence = np.max(probabilities, axis=1)
         accuracies = (y_pred == y_true).astype(float)
 
@@ -1239,7 +1586,9 @@ class EfficientNetB4FinetuneTrainer:
 
     # ------------------------------------------------------------------ reporting
 
-    def _final_metrics_report(self, targets, preds, probs, acc, best_epoch, ece, model_label):
+    def _final_metrics_report(self, targets, preds, probs, acc, best_epoch, ece,
+                              model_label, ece_before=None, temperature=None,
+                              argmax_invariant=True):
         """Final classification report, extended metrics, plots and summary printout."""
         print("\n" + "=" * 60)
         print("FINAL CLASSIFICATION REPORT")
@@ -1324,8 +1673,16 @@ class EfficientNetB4FinetuneTrainer:
         print(f"\nMean Confidence        : {mean_confidence:.4f}")
         print(f"Correct Confidence     : {correct_confidence:.4f}")
         print(f"Incorrect Confidence   : {incorrect_confidence:.4f}")
-        print(f"\nExpected Calibration Error : {ece:.4f} "
-              f"(temperature scaling disabled for this experiment)")
+        if temperature is not None:
+            print(f"\nTemperature scaling (Guo et al., fitted on validation):")
+            print(f"    Fitted T           : {temperature:.4f}")
+            if ece_before is not None:
+                print(f"    ECE before scaling : {ece_before:.4f}")
+            print(f"    ECE after scaling  : {ece:.4f}")
+            print(f"    Argmax invariance  : "
+                  f"{'PASS (predictions unchanged)' if argmax_invariant else 'FAIL'}")
+        else:
+            print(f"\nExpected Calibration Error : {ece:.4f}")
 
         print("\n------------------------------------------------------------")
         print("PER-CLASS METRICS")
@@ -1356,6 +1713,9 @@ class EfficientNetB4FinetuneTrainer:
             'correct_confidence': correct_confidence,
             'incorrect_confidence': incorrect_confidence,
             'ece': ece_plotted,
+            'ece_before_scaling': ece_before,
+            'temperature': temperature,
+            'temperature_argmax_invariant': argmax_invariant,
             'specificity_per_class': specificity_per_class,
             'roc_auc_per_class': roc_auc_per_class,
             'pr_auc_per_class': pr_auc_per_class,
@@ -1383,12 +1743,14 @@ class EfficientNetB4FinetuneTrainer:
         print(f"CuDNN: deterministic=True, benchmark=False (explicit reproducibility "
               f"choice; slightly slower than benchmark mode)")
         print(f"Optimizer: AdamW (weight_decay={self.weight_decay})")
-        print("Learning rates per parameter group:")
-        for group in optimizer.param_groups:
-            print(f"    {group['name']:<12} lr={group['lr']:.2e}")
-        print(f"Scheduler: linear warmup {self.warmup_epochs} epochs -> cosine decay to "
-              f"lr * {self.lr_end_factor} (head min {self.lr_head * self.lr_end_factor:.1e}); "
-              f"one schedule for the whole run, stable across unfreeze stages")
+        print("Learning rates per parameter group (peak LRs, restored recipe):")
+        for name, base in [('classifier', self.lr_head),
+                           ('blocks 6-8', self.lr_blocks_6_8),
+                           ('blocks 4-5', self.lr_blocks_4_5)]:
+            print(f"    {name:<12} lr={base:.2e}")
+        print("Scheduler: ReduceLROnPlateau(mode='max', factor=0.5, patience=5, "
+              "min_lr=1e-7) on validation Macro-F1, stepped after each validation "
+              "phase (warmup+cosine experiment closed)")
         print(f"Loss: {type(criterion).__name__}"
               + (f" (gamma={self.focal_gamma}, alpha=1/sqrt(count) mean-normalized)"
                  if self.loss_mode == 'focal' else
@@ -1403,17 +1765,29 @@ class EfficientNetB4FinetuneTrainer:
               f"-> HFlip(0.5) -> VFlip(0.5) -> Rotation(15) -> "
               f"ColorJitter(b=0.15, c=0.15, s=0.15, h=0.02) -> ToTensor -> "
               f"Normalize(ImageNet mean={IMAGENET_MEAN}, std={IMAGENET_STD})"
-              + (" -> RandomErasing(p=0.1)" if self.use_random_erasing else ""))
+              + (" -> RandomErasing(p=0.1)" if self.use_random_erasing else "")
+              + (" -> MixUp/CutMix (soft-target focal, batch-random pick)"
+                 if (self.use_mixup or self.use_cutmix) else ""))
         print(f"Augmentation (val/test): aspect-preserving Resize({self.eval_resize}) "
               f"-> CenterCrop({self.image_size}) -> ToTensor -> "
               f"Normalize(ImageNet mean={IMAGENET_MEAN}, std={IMAGENET_STD})")
-        print("Unfreezing schedule:")
-        print("    Epochs 1-3: head")
-        print("    Epochs 4-8: head + blocks 6-8")
-        print("    Epoch 9+:   head + blocks 4-8")
+        print("Unfreezing schedule (restored recipe):")
+        print("    Epochs 1-5: head")
+        print("    Epoch 6+:   head + blocks 6-8 (fixed epoch, consistently worked)")
+        print("    Blocks 4-5: plateau-gated — fires ONCE after "
+              f"{self.stage2_unfreeze_patience} epochs without a val Macro-F1 "
+              "improvement, with BN running stats frozen")
         print("    Blocks 0-3 remain frozen")
         print(f"Imbalance: plain shuffle + {self.loss_mode}")
         print(f"Model selection: validation Macro-F1 (also tracking validation accuracy)")
+        print(f"Temperature scaling: Guo et al., T fitted on validation "
+              f"({'TTA-averaged ' if self.use_tta else ''}logits)")
+        print(f"Ensemble: top-{self.keep_top_k_checkpoints} "
+              f"{'on' if self.use_ensemble else 'off'} (F1-weighted, post-stage-2 "
+              "members only, val-gated usage)")
+        print(f"TTA: {'on (final evaluation only)' if self.use_tta else 'off'}"
+              + (f", multi-scale (second scale {self.tta_second_scale}px)"
+                 if self.use_multiscale_tta else ""))
         if self.use_metadata:
             p = self.preprocessor
             print(f"Metadata branch: ENABLED (fused via MLP; classifier input "
@@ -1434,9 +1808,20 @@ class EfficientNetB4FinetuneTrainer:
     # ------------------------------------------------------------------ main loop
 
     def train(self):
-        """Full training pipeline: fixed unfreeze schedule, cosine schedule, AMP,
-        Macro-F1 + accuracy model selection, resume support, final TTA evaluation."""
+        """Full training pipeline: gradual unfreezing (fixed blocks 6-8 @ epoch 6,
+        plateau-gated blocks 4-5), ReduceLROnPlateau on val Macro-F1, top-K
+        checkpoint rotation, Macro-F1 + accuracy model selection, resume support,
+        temperature scaling + val-gated F1-weighted ensemble for the final test
+        evaluation."""
         set_seed(self.seed)
+
+        if self.resume_checkpoint is None:
+            # Fresh run: clear stale epoch-named best checkpoints from any previous
+            # experiment so the top-K rotation/ensemble only covers this run.
+            for stale in glob.glob('efficientnetb4_best_model_epoch*.pth'):
+                os.remove(stale)
+                print(f"   -> Removed stale best checkpoint from a previous run: {stale}")
+            self._best_checkpoints = []
 
         train_loader, val_loader, test_loader = self.create_dataloaders()
         model = self.build_model()
@@ -1483,6 +1868,9 @@ class EfficientNetB4FinetuneTrainer:
             best_acc_epoch = checkpoint['best_acc_epoch']
             patience_counter = checkpoint['patience_counter']
             history = checkpoint['history']
+            self._stage2_unfrozen = checkpoint.get('stage2_unfrozen', False)
+            self._stage2_epoch = checkpoint.get('stage2_epoch')
+            self._best_checkpoints = checkpoint.get('best_checkpoints', [])
 
             torch.set_rng_state(checkpoint['rng_state'])
             if checkpoint.get('cuda_rng_state') is not None and torch.cuda.is_available():
@@ -1522,42 +1910,60 @@ class EfficientNetB4FinetuneTrainer:
             print(f"Resuming from epoch: {start_epoch + 1}")
             print(f"Previous best validation Macro-F1: {best_macro_f1:.4f} @ epoch {best_epoch}")
             print(f"Previous best validation accuracy: {best_val_acc:.2f}% @ epoch {best_acc_epoch}")
-            if checkpoint.get('num_epochs', 0) < self.num_epochs:
-                print(f"NOTE: extending training from num_epochs={checkpoint['num_epochs']} "
-                      f"to {self.num_epochs} — the cosine tail is extended accordingly.")
+            print(f"Stage-2 (blocks 4-5) unfrozen: {self._stage2_unfrozen}"
+                  + (f" @ epoch {self._stage2_epoch}" if self._stage2_epoch else ""))
             print("=" * 60)
         else:
             print("\nNo checkpoint specified → starting from epoch 1")
 
-        # Deterministic unfreezing schedule (re-applied on resume so requires_grad
-        # flags always match the current stage).
+        # Rebuild the top-K list from disk: the in-memory list may predate the
+        # resume or files may have been trimmed externally.
+        if self._best_checkpoints:
+            self._rescan_checkpoints()
+        # Re-apply stage-2 BN running-stat freeze on resume (modules are new).
+        if self._stage2_unfrozen:
+            self._freeze_bn_stats(model, [4, 5])
+
+        # Stage-aware trainable flags (re-applied on resume so requires_grad
+        # always matches the current stage).
         self._set_trainable(model, start_epoch)
         if start_epoch >= self.num_epochs:
             print(f"Checkpoint already reached epoch {self.num_epochs}; no epochs left to train.")
 
         print("\n" + "=" * 60)
-        print("Training with Gradual Unfreezing (fixed schedule)")
+        print("Training with Gradual Unfreezing (restored recipe)")
         print("=" * 60)
-        print("    Epochs 1-3: head")
-        print("    Epochs 4-8: head + blocks 6-8")
-        print("    Epoch 9+:   head + blocks 4-8")
+        print("    Epochs 1-5: head")
+        print("    Epoch 6+:   head + blocks 6-8")
+        print(f"    Blocks 4-5: plateau-gated (after {self.stage2_unfreeze_patience} epochs "
+              f"without val Macro-F1 improvement; BN running stats frozen)")
         print("    Blocks 0-3 remain frozen")
         print("=" * 60)
 
         start_time = time.time()
         try:
             for epoch in range(start_epoch, self.num_epochs):
-                # ===== UNFREEZE TRANSITIONS (fixed epoch boundaries, 0-based) =====
-                if epoch == 3:
+                # ===== UNFREEZE TRANSITIONS =====
+                # Blocks 6-8: fixed at 1-based epoch 6 (0-based idx 5) — this fixed
+                # epoch consistently worked, so it stays fixed.
+                if epoch == 5 and not self._stage2_unfrozen:
                     print(f"\nUNFREEZING blocks 6-8 at epoch {epoch + 1} "
                           f"(head + blocks 6-8 from now on)...")
                     self._set_trainable(model, epoch)
-                if epoch == 8:
+                # Blocks 4-5: plateau-gated, fires ONCE — only after blocks 6-8 have
+                # had room to help and val Macro-F1 has gone stage2_unfreeze_patience
+                # epochs without improving (reuses the early-stopping patience
+                # counter; no duplicate tracking). BN running stats in blocks 4-5
+                # are pinned to eval mode on firing (small-batch stabilizer).
+                if (not self._stage2_unfrozen and epoch > 5
+                        and patience_counter >= self.stage2_unfreeze_patience):
                     print(f"\nUNFREEZING blocks 4-5 at epoch {epoch + 1} "
-                          f"(head + blocks 4-8 from now on)...")
+                          f"(no val Macro-F1 improvement for {patience_counter} "
+                          f"epochs)...")
+                    self._stage2_unfrozen = True
+                    self._stage2_epoch = epoch + 1
                     self._set_trainable(model, epoch)
-
-                scheduler.step()
+                    self._freeze_bn_stats(model, [4, 5])
 
                 train_loss, train_acc = self.train_epoch(model, train_loader, criterion, optimizer)
                 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1592,6 +1998,17 @@ class EfficientNetB4FinetuneTrainer:
                 for group in optimizer.param_groups:
                     print(f"    {group['name']:<12} lr={group['lr']:.2e}")
 
+                # ===== SCHEDULER STEP =====
+                # ReduceLROnPlateau tracks the same metric used for model
+                # selection: val Macro-F1 (mode='max'). Must stay before the
+                # last-checkpoint save so the saved scheduler state points at
+                # the next epoch on resume.
+                lr_before = [g['lr'] for g in optimizer.param_groups]
+                scheduler.step(val_macro_f1)
+                lr_after = [g['lr'] for g in optimizer.param_groups]
+                if lr_after != lr_before:
+                    print("    ReduceLROnPlateau: LR reduced (factor 0.5)")
+
                 # ===== BEST-MODEL UPDATE (primary metric: validation Macro-F1) =====
                 if val_macro_f1 > best_macro_f1:
                     improvement = val_macro_f1 - best_macro_f1
@@ -1601,6 +2018,17 @@ class EfficientNetB4FinetuneTrainer:
                     best_state = self._best_state(
                         model, best_epoch, best_macro_f1, val_acc, val_loss,
                         val_balanced_acc, val_weighted_f1)
+                    # Rotating top-K filenames: keep the best K by Macro-F1 on
+                    # disk for the ensemble, delete worse ones. The canonical
+                    # unqualified filename is kept as a copy of the single best
+                    # so resume/external tooling is unaffected.
+                    rotating_path = f'efficientnetb4_best_model_epoch{best_epoch}.pth'
+                    torch.save(best_state, rotating_path)
+                    self._best_checkpoints = [
+                        e for e in self._best_checkpoints if e['path'] != rotating_path]
+                    self._best_checkpoints.append(
+                        {'path': rotating_path, 'f1': best_macro_f1, 'epoch': best_epoch})
+                    self._trim_checkpoints()
                     torch.save(best_state, 'efficientnetb4_best_model.pth')
                     print(f"SAVING MODEL -> Epoch {epoch + 1} | New Best Macro F1: "
                           f"{best_macro_f1:.4f} (+{improvement:.4f}) | Acc: {val_acc:.2f}%")
@@ -1648,11 +2076,15 @@ class EfficientNetB4FinetuneTrainer:
                     'lr_head': self.lr_head,
                     'lr_blocks_6_8': self.lr_blocks_6_8,
                     'lr_blocks_4_5': self.lr_blocks_4_5,
-                    'warmup_epochs': self.warmup_epochs,
-                    'lr_end_factor': self.lr_end_factor,
                     'seed': self.seed,
                     'use_metadata': self.use_metadata,
                     'metadata_preprocessor_state': self._preprocessor_state(),
+                    'stage2_unfrozen': self._stage2_unfrozen,
+                    'stage2_epoch': self._stage2_epoch,
+                    'stage2_unfreeze_patience': self.stage2_unfreeze_patience,
+                    'use_ensemble': self.use_ensemble,
+                    'keep_top_k_checkpoints': self.keep_top_k_checkpoints,
+                    'best_checkpoints': self._best_checkpoints,
                 }, 'efficientnetb4_last_checkpoint.pth')
 
                 # ===== EARLY STOPPING (validation Macro-F1) =====
@@ -1676,6 +2108,8 @@ class EfficientNetB4FinetuneTrainer:
               f"(~{total_training_time / max(1, len(history['train_loss'])):.1f} s/epoch)")
         print(f"Best Validation Macro F1: {best_macro_f1:.4f} (epoch {best_epoch})")
         print(f"Best Validation Accuracy: {best_val_acc:.2f}% (epoch {best_acc_epoch})")
+        if self._stage2_unfrozen:
+            print(f"Stage-2 (blocks 4-5) unfreeze fired at epoch {self._stage2_epoch}")
 
         # Evaluate the best-Macro-F1 model on the held-out test set (touched at the end).
         best_model_path = 'efficientnetb4_best_model.pth'
@@ -1690,29 +2124,160 @@ class EfficientNetB4FinetuneTrainer:
             model, test_loader, criterion, epoch_label="test")
         no_tta_f1 = f1_score(no_tta_preds, no_tta_targets, average='macro', zero_division=0)
 
+        # ===== SINGLE BEST MODEL: val (temperature + gate) / test (report) =====
         if self.use_tta:
-            final_probs, final_targets, _ = self.predict_with_tta(model, test_loader)
+            val_probs_single, val_targets_single, _ = self.predict_with_tta(
+                model, val_loader)
+            test_probs_single, test_targets, test_logits_single = self.predict_with_tta(
+                model, test_loader)
+        else:
+            _, _, _, val_targets_single, val_probs_single = self.validate(
+                model, val_loader, criterion, epoch_label="val")
+            test_probs_single, test_targets = no_tta_probs, no_tta_targets
+            _, test_logits_single = self.collect_logits(model, test_loader,
+                                                        epoch_label="test")
+
+        single_val_f1 = self._score_probs(val_probs_single, val_targets_single)['macro_f1']
+
+        # ===== MULTI-SCALE TTA INCREMENTAL GAIN (Phase 5, opt-in) =====
+        tta_single_scale_f1 = None
+        if self.use_tta and self.use_multiscale_tta:
+            probs_ss, _, _ = self.predict_with_tta(
+                model, test_loader, scales=[self.image_size])
+            tta_single_scale_f1 = f1_score(
+                probs_ss.argmax(axis=1), test_targets, average='macro',
+                zero_division=0)
+            f1_ms = f1_score(test_probs_single.argmax(axis=1), test_targets,
+                             average='macro', zero_division=0)
+            print(f"\nTTA scale gain: single-scale ({self.image_size}px) "
+                  f"Macro-F1 {tta_single_scale_f1:.4f} -> multi-scale "
+                  f"(+{self.tta_second_scale}px) Macro-F1 {f1_ms:.4f} "
+                  f"(gain {f1_ms - tta_single_scale_f1:+.4f})")
+
+        # ===== TEMPERATURE SCALING (Guo et al.) — fit T on VALIDATION =====
+        print("\n" + "=" * 60)
+        print("TEMPERATURE SCALING (fitted on validation, never on test)")
+        print("=" * 60)
+        temperature = self.fit_temperature(model, val_loader)
+        print(f"    Fitted T: {temperature:.4f} "
+              f"(CE(logits/T, y) via LBFGS on val"
+              + (", TTA-averaged logits" if self.use_tta else ", single-pass logits")
+              + ")")
+
+        scaled_single = self._apply_temperature(test_logits_single, temperature)
+        ece_before_single = self._compute_ece(
+            test_targets, test_probs_single.argmax(axis=1), test_probs_single)
+        ece_after_single = self._compute_ece(
+            test_targets, scaled_single.argmax(axis=1), scaled_single)
+        invariant_single = self._check_temperature_invariance(test_probs_single,
+                                                              scaled_single)
+        print(f"    ECE before scaling: {ece_before_single:.4f}")
+        print(f"    ECE after scaling : {ece_after_single:.4f}")
+        print(f"    Argmax invariance : "
+              f"{'PASS (no prediction changed)' if invariant_single else 'FAIL'}")
+
+        # ===== ENSEMBLE (top-K, F1-weighted, post-stage-2, val-gated) =====
+        ensemble_result = None
+        use_ensemble_final = False
+        if self.use_ensemble:
+            members = self._eligible_ensemble_members()
+            if not members:
+                print("\nENSEMBLE: no top-K best checkpoints available — using "
+                      "single best model.")
+            else:
+                print("\n" + "=" * 60)
+                print("ENSEMBLE EVALUATION (top-K best checkpoints, F1-weighted)")
+                print("=" * 60)
+                print("Eligible members (post-stage-2 only once stage 2 fired):")
+                val_probs_ens, val_targets_ens, _ = self._ensemble_probs(
+                    model, val_loader, members, criterion)
+                test_probs_ens, test_targets_ens, _ = self._ensemble_probs(
+                    model, test_loader, members, criterion)
+                if val_probs_ens is None:
+                    print("    No ensemble member could be loaded — using single best.")
+                else:
+                    ens_val = self._score_probs(val_probs_ens, val_targets_ens)
+                    ens_test = self._score_probs(test_probs_ens, test_targets_ens)
+                    # Fit the ensemble's own temperature on its VALIDATION probs.
+                    temp_ens = self.fit_temperature_on_probs(
+                        val_probs_ens, val_targets_ens)
+                    scaled_ens = self._apply_temperature(
+                        np.log(np.clip(test_probs_ens, 1e-12, 1.0)), temp_ens)
+                    ece_before_ens = self._compute_ece(
+                        test_targets_ens, test_probs_ens.argmax(axis=1), test_probs_ens)
+                    ece_after_ens = self._compute_ece(
+                        test_targets_ens, scaled_ens.argmax(axis=1), scaled_ens)
+                    invariant_ens = self._check_temperature_invariance(
+                        test_probs_ens, scaled_ens)
+
+                    # ===== VAL-ONLY USAGE DECISION (never looks at test) =====
+                    print("\n    VALIDATION GATE (decision on validation only):")
+                    print(f"        Single best val Macro-F1: {single_val_f1:.4f}")
+                    print(f"        Ensemble val Macro-F1   : {ens_val['macro_f1']:.4f}")
+                    if ens_val['macro_f1'] > single_val_f1:
+                        use_ensemble_final = True
+                        print("        Decision: ENSEMBLE used on test "
+                              "(wins on validation)")
+                    else:
+                        print("        Decision: SINGLE BEST used on test "
+                              "(ensemble does not beat it on validation)")
+                    if use_ensemble_final:
+                        print("    Ensemble temperature (fitted on val probs): "
+                              f"{temp_ens:.4f}")
+                        print(f"    Ensemble ECE before scaling: {ece_before_ens:.4f}")
+                        print(f"    Ensemble ECE after scaling : {ece_after_ens:.4f}")
+                    ensemble_result = {
+                        'used': use_ensemble_final,
+                        'val_macro_f1': ens_val['macro_f1'],
+                        'test_macro_f1': ens_test['macro_f1'],
+                        'test_balanced_acc': ens_test['balanced_acc'],
+                        'members': [e['path'] for e in members],
+                        'temperature': temp_ens,
+                        'ece_before': ece_before_ens,
+                        'ece_after': ece_after_ens,
+                        'argmax_invariant': invariant_ens,
+                    }
+                print("=" * 60)
+
+        # ===== FINAL REPORTED PREDICTIONS (temperature-scaled, ensemble or single) =====
+        if use_ensemble_final and ensemble_result is not None:
+            final_probs = scaled_ens
+            final_targets = test_targets_ens
             final_preds = final_probs.argmax(axis=1)
             final_acc = 100.0 * float((final_preds == final_targets).mean())
-            tta_f1 = f1_score(final_preds, final_targets, average='macro', zero_division=0)
-            print(f"\nTest Macro-F1: no-TTA {no_tta_f1:.4f} -> TTA {tta_f1:.4f}")
+            tta_f1 = f1_score(final_preds, final_targets, average='macro',
+                              zero_division=0)
+            ece = ece_after_ens
+            ece_before = ece_before_ens
+            temperature_final = ensemble_result['temperature']
+            argmax_invariant = ensemble_result['argmax_invariant']
+            model_label = "F1-weighted ensemble (TTA)" if self.use_tta \
+                else "F1-weighted ensemble (no TTA)"
         else:
-            final_probs = no_tta_probs
-            final_targets = no_tta_targets
-            final_preds = no_tta_preds
-            final_acc = no_tta_acc
-            tta_f1 = no_tta_f1
+            final_probs = scaled_single
+            final_targets = test_targets
+            final_preds = final_probs.argmax(axis=1)
+            final_acc = 100.0 * float((final_preds == final_targets).mean())
+            tta_f1 = f1_score(final_preds, final_targets, average='macro',
+                              zero_division=0)
+            ece = ece_after_single
+            ece_before = ece_before_single
+            temperature_final = temperature
+            argmax_invariant = invariant_single
+            model_label = "single best (TTA)" if self.use_tta \
+                else "single best (no TTA)"
 
-        # Calibration is reported as-is (temperature scaling disabled for this experiment).
-        ece = self._compute_ece(final_targets, final_preds, final_probs)
+        if self.use_tta:
+            print(f"\nTest Macro-F1: no-TTA {no_tta_f1:.4f} -> TTA {tta_f1:.4f}")
 
         self.plot_training_curves(history)
         self.plot_trainable_parameters(history)
         self.plot_generalization_gap(history)
 
-        model_label = "single best (TTA)" if self.use_tta else "single best (no TTA)"
         report_metrics = self._final_metrics_report(
-            final_targets, final_preds, final_probs, final_acc, best_epoch, ece, model_label)
+            final_targets, final_preds, final_probs, final_acc, best_epoch, ece,
+            model_label, ece_before=ece_before, temperature=temperature_final,
+            argmax_invariant=argmax_invariant)
 
         # ===== EXPERIMENT CONFIGURATION RECAP (as run) =====
         print("\n" + "=" * 60)
@@ -1730,14 +2295,24 @@ class EfficientNetB4FinetuneTrainer:
         print(f"Optimizer: AdamW (weight_decay={self.weight_decay}) | "
               f"LRs: head {self.lr_head:.1e}, blocks 6-8 {self.lr_blocks_6_8:.1e}, "
               f"blocks 4-5 {self.lr_blocks_4_5:.1e}")
-        print(f"Scheduler: warmup {self.warmup_epochs} epochs + cosine to "
-              f"lr*{self.lr_end_factor} | Loss: {self.loss_mode} | AMP: {self.use_amp}")
-        print(f"Unfreezing: head (epochs 1-3) -> +blocks 6-8 (epochs 4-8) -> "
-              f"+blocks 4-5 (epoch 9+); blocks 0-3 frozen")
+        print(f"Scheduler: ReduceLROnPlateau(mode='max', factor=0.5, patience=5, "
+              f"min_lr=1e-7) on val Macro-F1 | Loss: {self.loss_mode} | AMP: {self.use_amp}")
+        print(f"Unfreezing: head (epochs 1-5) -> +blocks 6-8 (epoch 6+) -> +blocks 4-5 "
+              f"(plateau-gated: {self.stage2_unfreeze_patience} epochs without val "
+              f"Macro-F1 improvement, BN running stats frozen"
+              + (f", fired @ epoch {self._stage2_epoch}" if self._stage2_epoch else "")
+              + "); blocks 0-3 frozen")
         print(f"Model selection: validation Macro-F1 (epoch {best_epoch}) | "
               f"validation accuracy (epoch {best_acc_epoch})")
-        print(f"TTA: {'enabled (final evaluation only)' if self.use_tta else 'disabled'} | "
-              f"Ensemble: disabled | Temperature scaling: disabled")
+        print(f"TTA: {'enabled (final evaluation only)' if self.use_tta else 'disabled'}"
+              + (f", multi-scale (second scale {self.tta_second_scale}px)"
+                 if self.use_multiscale_tta else "")
+              + f" | Ensemble: {'on' if self.use_ensemble else 'off'} "
+              f"(top-{self.keep_top_k_checkpoints}, F1-weighted, "
+              f"{'USED on test' if use_ensemble_final else 'NOT used on test (lost val gate)'})"
+              + f" | Temperature scaling: on (T={temperature_final:.4f})")
+        print(f"MixUp: {'on' if self.use_mixup else 'off'} | "
+              f"CutMix: {'on' if self.use_cutmix else 'off'}")
         print(f"Random seed: {self.seed} | Class order: {self.class_names}")
         if self.use_metadata:
             print(f"Metadata: ENABLED ({METADATA_EXPERIMENT_ID}) — dim {self.metadata_dim}, "
@@ -1747,6 +2322,10 @@ class EfficientNetB4FinetuneTrainer:
         print(f"Best validation Macro F1: {best_macro_f1:.4f} @ epoch {best_epoch}")
         print(f"Test Macro-F1: no-TTA {no_tta_f1:.4f} -> final {tta_f1:.4f} | "
               f"Test accuracy: {final_acc:.2f}%")
+        if ensemble_result is not None:
+            print(f"Ensemble: val F1 {ensemble_result['val_macro_f1']:.4f} | "
+                  f"test F1 {ensemble_result['test_macro_f1']:.4f} | "
+                  f"members {len(ensemble_result['members'])}")
         print("=" * 60)
 
         # ===== SAVE FULL METRICS =====
@@ -1763,11 +2342,15 @@ class EfficientNetB4FinetuneTrainer:
             'lr_head': self.lr_head,
             'lr_blocks_6_8': self.lr_blocks_6_8,
             'lr_blocks_4_5': self.lr_blocks_4_5,
-            'warmup_epochs': self.warmup_epochs,
-            'lr_end_factor': self.lr_end_factor,
             'use_amp': self.use_amp,
             'use_tta': self.use_tta,
+            'use_multiscale_tta': self.use_multiscale_tta,
+            'tta_second_scale': self.tta_second_scale,
             'use_random_erasing': self.use_random_erasing,
+            'use_mixup': self.use_mixup,
+            'use_cutmix': self.use_cutmix,
+            'use_ensemble': self.use_ensemble,
+            'keep_top_k_checkpoints': self.keep_top_k_checkpoints,
             'use_metadata': self.use_metadata,
             'metadata_dim': self.metadata_dim,
             'metadata_feature_names': self.preprocessor.feature_names
@@ -1789,9 +2372,22 @@ class EfficientNetB4FinetuneTrainer:
             'best_acc_epoch': best_acc_epoch,
             'no_tta_macro_f1': no_tta_f1,
             'tta_macro_f1': tta_f1,
+            'tta_single_scale_macro_f1': tta_single_scale_f1,
             'final_accuracy': final_acc,
             'total_training_time': total_training_time,
             'epochs_trained': len(history['train_loss']),
+            'stage2_unfrozen': self._stage2_unfrozen,
+            'stage2_epoch': self._stage2_epoch,
+            'stage2_unfreeze_patience': self.stage2_unfreeze_patience,
+            'ensemble_used': use_ensemble_final,
+            'ensemble_val_macro_f1': ensemble_result['val_macro_f1']
+            if ensemble_result is not None else None,
+            'ensemble_test_macro_f1': ensemble_result['test_macro_f1']
+            if ensemble_result is not None else None,
+            'ensemble_test_balanced_acc': ensemble_result['test_balanced_acc']
+            if ensemble_result is not None else None,
+            'ensemble_members': ensemble_result['members'] if ensemble_result else None,
+            'temperature': temperature_final,
         }
         metrics.update(report_metrics)
         torch.save(metrics, 'efficientnetb4_training_metrics.pth')
@@ -1803,8 +2399,8 @@ class EfficientNetB4FinetuneTrainer:
     def _check_resume_compatible(self, checkpoint):
         """Refuse to resume a checkpoint from a different experiment/config so a
         stale file can never silently corrupt a fresh run's results. num_epochs is
-        the one exception: resuming with MORE epochs extends the cosine tail
-        (warned in the resume block); shrinking is refused."""
+        the one exception: resuming with MORE epochs is allowed (ReduceLROnPlateau
+        has no fixed schedule tail to extend); shrinking is refused."""
         expected = {
             'experiment_id': self.experiment_id,
             'loss_mode': self.loss_mode,
@@ -1814,8 +2410,6 @@ class EfficientNetB4FinetuneTrainer:
             'lr_head': self.lr_head,
             'lr_blocks_6_8': self.lr_blocks_6_8,
             'lr_blocks_4_5': self.lr_blocks_4_5,
-            'warmup_epochs': self.warmup_epochs,
-            'lr_end_factor': self.lr_end_factor,
             'seed': self.seed,
         }
         # Old image-only checkpoints predate use_metadata -> treat missing key as False.
@@ -1858,6 +2452,31 @@ if __name__ == "__main__":
     parser.add_argument(
         "--metadata-csv", default=DEFAULT_METADATA_CSV,
         help="ground-truth CSV with metadata columns (default: %(default)s)")
+    parser.add_argument("--num-epochs", type=int, default=50,
+                        help="maximum epochs (default: %(default)s)")
+    parser.add_argument("--lr-head", type=float, default=1e-3,
+                        help="peak head LR (default: %(default)s); blocks 6-8 = "
+                             "head*0.1, blocks 4-5 = head*0.05 unless overridden")
+    parser.add_argument("--stage2-unfreeze-patience", type=int, default=4,
+                        help="epochs without val Macro-F1 improvement before the "
+                             "blocks-4-5 unfreeze fires (default: %(default)s)")
+    parser.add_argument("--use-ensemble", dest="use_ensemble", action="store_true",
+                        default=True, help="F1-weighted top-K ensemble (default: on)")
+    parser.add_argument("--no-ensemble", dest="use_ensemble", action="store_false",
+                        help="disable the checkpoint ensemble")
+    parser.add_argument("--keep-top-k", type=int, default=3,
+                        help="top-K best checkpoints kept for the ensemble "
+                             "(default: %(default)s)")
+    parser.add_argument("--use-mixup", action="store_true",
+                        help="opt-in MixUp (alpha=0.2, soft-target focal)")
+    parser.add_argument("--use-cutmix", action="store_true",
+                        help="opt-in CutMix (alpha=1.0, soft-target focal)")
+    parser.add_argument("--use-multiscale-tta", action="store_true",
+                        help="opt-in second-scale TTA (adds tta-second-scale px)")
+    parser.add_argument("--tta-second-scale", type=int, default=456,
+                        help="second TTA scale in px (default: %(default)s)")
+    parser.add_argument("--no-tta", dest="use_tta", action="store_false",
+                        help="disable test-time augmentation")
     args = parser.parse_args()
 
     # Auto-resume when a last checkpoint exists (crash recovery); start fresh otherwise.
@@ -1866,9 +2485,18 @@ if __name__ == "__main__":
         resume_path = None
     trainer = EfficientNetB4FinetuneTrainer(
         data_dir='HAM10000_split/train',
-        num_epochs=50,
+        num_epochs=args.num_epochs,
         resume_checkpoint=resume_path,
         use_metadata=args.use_metadata,
         metadata_csv=args.metadata_csv,
+        lr_head=args.lr_head,
+        stage2_unfreeze_patience=args.stage2_unfreeze_patience,
+        use_ensemble=args.use_ensemble,
+        keep_top_k_checkpoints=args.keep_top_k,
+        use_tta=args.use_tta,
+        use_mixup=args.use_mixup,
+        use_cutmix=args.use_cutmix,
+        use_multiscale_tta=args.use_multiscale_tta,
+        tta_second_scale=args.tta_second_scale,
     )
     model, history, metrics = trainer.train()
