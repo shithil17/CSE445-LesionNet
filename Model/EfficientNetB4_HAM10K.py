@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import datasets, transforms, models
@@ -23,18 +24,65 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+def set_seed(seed):
+    """Seed every RNG the pipeline touches so fresh runs are reproducible."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+class FocalLoss(nn.Module):
+    """FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t), computed from log_softmax output.
+
+    alpha: optional per-class weights (tensor on the model device); None = unweighted.
+    TODO: label smoothing could be folded into the log-prob term if needed.
+    """
+
+    def __init__(self, gamma=2.0, alpha=None, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        log_probs = F.log_softmax(logits, dim=1)
+        target_log_probs = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        p_t = target_log_probs.exp()
+        loss = -(1.0 - p_t) ** self.gamma * target_log_probs
+        if self.alpha is not None:
+            loss = self.alpha[targets] * loss
+        if self.reduction == 'mean':
+            return loss.mean()
+        return loss.sum()
+
+
 class EfficientNetB4GradualUnfreezingTrainer:
-    def __init__(self, data_dir, val_data_dir='HAM10000_split/val', test_data_dir='HAM10000_split/test', batch_size=32, num_epochs=50, learning_rate=0.001, sampler_mode='sqrt', loss_mode='weighted_ce', resume_checkpoint=None, early_stop_patience=10):
+    def __init__(self, data_dir, val_data_dir='HAM10000_split/val', test_data_dir='HAM10000_split/test', batch_size=None, num_epochs=50, learning_rate=0.001, image_size=380, seed=42, imbalance_strategy='focal', sampler_mode='sqrt', loss_mode='weighted_ce', focal_gamma=2.0, grad_accum_steps=1, weight_decay=1e-4, label_smoothing=0.05, resume_checkpoint=None, early_stop_patience=7):
         """
         EfficientNetB4 with gradual unfreezing:
         - Epochs 1-4: Train only head (frozen backbone)
         - Epoch 5: Unfreeze blocks 6, 7, 8 (deepest blocks)
-        - Epoch 25: Unfreeze blocks 4, 5 (batch size 32 to fit on ~6 GB GPU)
+        - Epoch 25: Unfreeze blocks 4, 5 (image_size 380 needs smaller batch to fit on ~6 GB GPU)
         - data_dir = raw TRAIN split (HAM10000_split/train); augmentation is on-the-fly
         - val_data_dir = raw VAL split, used only for best-model / early-stop / LR step
         - test_data_dir = raw TEST split, evaluated exactly once at the end
+        - image_size = train/eval resolution; EfficientNetB4's native input is 380x380 (default)
+        - seed = RNG seed for a fresh (non-resume) run; resume restores saved RNG state instead
+        - imbalance_strategy = single imbalance-correction mechanism:
+            'sampler_only' = WeightedRandomSampler + plain CE
+            'loss_only'    = plain shuffle + weighted CE (1/sqrt(count), mean-normalized)
+            'focal'        = plain shuffle + FocalLoss (default)
+            'both'         = WeightedRandomSampler + weighted CE (old stacked behavior, for comparison)
         - sampler_mode = 'sqrt' (1/sqrt(count), default) | 'inverse' (1/count) | 'none' (plain shuffle)
         - loss_mode = 'ce' (baseline) | 'weighted_ce' (1/sqrt(count) weights, mean-normalized to ~1)
+        - focal_gamma = focusing parameter for FocalLoss (default 2.0)
+        - grad_accum_steps = accumulate gradients over this many batches before stepping, so
+          effective batch size = batch_size * grad_accum_steps (default 1 = no accumulation)
+        - weight_decay = AdamW weight decay, applied to every param group (incl. unfreezes)
+        - label_smoothing = CE smoothing (focal loss skips it; see FocalLoss TODO)
         - resume_checkpoint = path to efficientnetb4_last_checkpoint.pth to resume from, or None for a fresh run
         - early_stop_patience = epochs without validation Macro-F1 improvement before stopping
         """
@@ -42,14 +90,30 @@ class EfficientNetB4GradualUnfreezingTrainer:
             raise ValueError(
                 f"Unknown loss_mode: {loss_mode!r}. Supported values: 'ce', 'weighted_ce'."
             )
+        if imbalance_strategy not in ('sampler_only', 'loss_only', 'focal', 'both'):
+            raise ValueError(
+                f"Unknown imbalance_strategy: {imbalance_strategy!r}. Supported values: "
+                f"'sampler_only', 'loss_only', 'focal', 'both'."
+            )
+        if batch_size is None:
+            # 380px tensors are ~2.9x the pixels of 224px; batch 16 (vs 32) keeps memory in
+            # range on a ~6 GB GPU. grad_accum_steps restores the effective batch size if needed.
+            batch_size = 16 if image_size >= 320 else 32
         self.data_dir = data_dir
         self.val_data_dir = val_data_dir
         self.test_data_dir = test_data_dir
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
+        self.image_size = image_size
+        self.seed = seed
+        self.imbalance_strategy = imbalance_strategy
         self.sampler_mode = sampler_mode
         self.loss_mode = loss_mode
+        self.focal_gamma = focal_gamma
+        self.grad_accum_steps = grad_accum_steps
+        self.weight_decay = weight_decay
+        self.label_smoothing = label_smoothing
         self.resume_checkpoint = resume_checkpoint
         self.early_stop_patience = early_stop_patience
         self.num_classes = 7
@@ -60,6 +124,9 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print("="*60)
         print("EfficientNetB4 with Gradual Unfreezing (Blocks 6-8 @ epoch 5; blocks 4-5 @ epoch 25)")
         print("="*60)
+        print(f"Image size: {self.image_size}x{self.image_size}")
+        print(f"Random seed: {self.seed}")
+        print(f"Imbalance strategy: {self.imbalance_strategy}")
         print(f"Loss mode: {self.loss_mode}")
         print(f"Sampler mode: {self.sampler_mode}")
         print(f"Model selection: Macro-F1")
@@ -67,24 +134,35 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print(f"Resume: {self.resume_checkpoint}")
         print("="*60)
 
+    def _worker_init_fn(self, worker_id):
+        """Seed numpy/random per worker from torch's initial_seed() (itself derived from
+        the loader generator's manual_seed), so worker-side transform randomness and
+        sampler draws are reproducible across runs with the same seed."""
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
     def create_dataloaders(self):
         """Train on the raw train split with on-the-fly augmentation; early-stop on raw val; final eval on raw test."""
-        # EfficientNetB4 optimal input size is 380x380, but using 224x224 for consistency
+        # EfficientNetB4 native input size is 380x380; self.image_size (default 380) keeps
+        # fine dermoscopic detail (pigment network, borders, blue-white veil) that 224px loses
         # Train: on-the-fly augmentation, conservative geometric only (no vertical flip, no black fill)
+        resize_scale = int(self.image_size * 256 / 224)
         train_transform = transforms.Compose([
-            transforms.Resize((256, 256)),
+            transforms.Resize((resize_scale, resize_scale)),
             transforms.RandomResizedCrop(
-                224,
+                self.image_size,
                 scale=(0.9, 1.0),
                 ratio=(0.95, 1.05)
             ),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomRotation(15),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
             transforms.ToTensor(),
         ])
 
         val_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((self.image_size, self.image_size)),
             transforms.ToTensor(),
         ])
 
@@ -102,28 +180,39 @@ class EfficientNetB4GradualUnfreezingTrainer:
                     f"Train/{name} class folders differ: {self.class_names} vs {ds.classes}"
                 )
 
-        # Moderated class-balanced sampling (WeightedRandomSampler replaces shuffle)
+        # Single imbalance-correction mechanism per run: sampler only for
+        # 'sampler_only'/'both', plain shuffle otherwise.
+        use_sampler = self.imbalance_strategy in ('sampler_only', 'both')
         class_counts = np.bincount(train_dataset.targets, minlength=self.num_classes)
         self.class_counts = class_counts
-        if self.sampler_mode == 'sqrt':
+        if use_sampler and self.sampler_mode == 'sqrt':
             class_weights = 1.0 / np.sqrt(class_counts)
-        elif self.sampler_mode == 'inverse':
+        elif use_sampler and self.sampler_mode == 'inverse':
             class_weights = 1.0 / class_counts
-        elif self.sampler_mode == 'none':
-            class_weights = None
         else:
-            raise ValueError(f"Unknown sampler_mode: {self.sampler_mode}")
+            class_weights = None
+            if use_sampler:
+                raise ValueError(
+                    f"Unknown sampler_mode: {self.sampler_mode}. 'none' (plain shuffle) is "
+                    f"contradictory with imbalance_strategy={self.imbalance_strategy!r}; use "
+                    f"'loss_only' or 'focal' for plain-shuffle training."
+                )
+
+        train_generator = torch.Generator().manual_seed(self.seed)
+        val_generator = torch.Generator().manual_seed(self.seed)
+        test_generator = torch.Generator().manual_seed(self.seed)
 
         if class_weights is not None:
             sample_weights = np.array([class_weights[t] for t in train_dataset.targets])
             train_sampler = WeightedRandomSampler(
-                sample_weights, num_samples=len(train_dataset), replacement=True
+                sample_weights, num_samples=len(train_dataset), replacement=True,
+                generator=train_generator
             )
-            train_loader = DataLoader(train_dataset, batch_size=self.batch_size, sampler=train_sampler, num_workers=4, pin_memory=True)
+            train_loader = DataLoader(train_dataset, batch_size=self.batch_size, sampler=train_sampler, num_workers=4, pin_memory=True, generator=train_generator, worker_init_fn=self._worker_init_fn)
         else:
-            train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4, pin_memory=True)
-        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+            train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True, generator=train_generator, worker_init_fn=self._worker_init_fn)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4, pin_memory=True, generator=val_generator, worker_init_fn=self._worker_init_fn)
+        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4, pin_memory=True, generator=test_generator, worker_init_fn=self._worker_init_fn)
 
         print(f"Training samples: {len(train_dataset)}")
         print(f"Validation samples: {len(val_dataset)}")
@@ -147,6 +236,9 @@ class EfficientNetB4GradualUnfreezingTrainer:
 
         # Replace classifier head
         num_features = model.classifier[1].in_features
+        # TODO: metadata fusion — HAM10000 metadata (age/sex/localization) could be fused via a
+        # small MLP branch concatenated with pooled features before this Linear, gated behind a
+        # use_metadata flag; skipped because the ImageFolder pipeline has no metadata plumbing.
         model.classifier = nn.Sequential(
             nn.Dropout(0.2),
             nn.Linear(num_features, self.num_classes)
@@ -183,7 +275,8 @@ class EfficientNetB4GradualUnfreezingTrainer:
         if parameters_to_add:
             optimizer.add_param_group({
                 'params': parameters_to_add,
-                'lr': self.learning_rate * lr_factor
+                'lr': self.learning_rate * lr_factor,
+                'weight_decay': self.weight_decay
             })
             print(f"   → Unfrozen {unfrozen_count:,} parameters in blocks {block_indices}")
             return unfrozen_count
@@ -191,19 +284,31 @@ class EfficientNetB4GradualUnfreezingTrainer:
 
     def _build_criterion(self):
         """
-        Loss function:
-        - 'ce': plain CrossEntropyLoss (baseline)
-        - 'weighted_ce': CrossEntropyLoss with mild 1/sqrt(class_count) weights,
-          mean-normalized to ~1.0 (never full inverse-frequency, which over-corrects
-          the minority classes on top of the sqrt sampler).
+        Dispatch on the single active imbalance strategy:
+        - 'sampler_only': plain CrossEntropyLoss (sampler does the rebalancing)
+        - 'loss_only': CrossEntropyLoss with mild 1/sqrt(class_count) weights,
+          mean-normalized to ~1.0 (never full inverse-frequency, which over-corrects)
+        - 'focal': FocalLoss(gamma=self.focal_gamma); alpha = 1/sqrt(count)
+          mean-normalized weights when loss_mode='weighted_ce', else unweighted
+        - 'both': weighted CrossEntropyLoss on top of the sampler (old stacked
+          behavior, kept for comparison)
         """
-        if self.loss_mode == 'ce':
-            return nn.CrossEntropyLoss()
         counts = self.class_counts.astype(np.float64)
         class_weights = 1.0 / np.sqrt(counts)
         class_weights = class_weights / class_weights.mean()
         self.class_weights = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
-        return nn.CrossEntropyLoss(weight=self.class_weights)
+
+        if self.imbalance_strategy == 'focal':
+            alpha = self.class_weights if self.loss_mode == 'weighted_ce' else None
+            return FocalLoss(gamma=self.focal_gamma, alpha=alpha)
+        if self.imbalance_strategy == 'loss_only':
+            if self.loss_mode == 'ce':
+                return nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+            return nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.label_smoothing)
+        if self.imbalance_strategy == 'both':
+            return nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.label_smoothing)
+        # 'sampler_only'
+        return nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
 
     def train_epoch(self, model, train_loader, criterion, optimizer, epoch):
         """Train for one epoch"""
@@ -217,11 +322,14 @@ class EfficientNetB4GradualUnfreezingTrainer:
         for batch_idx, (data, target) in enumerate(pbar):
             data, target = data.to(self.device), target.to(self.device)
 
-            optimizer.zero_grad()
             output = model(data)
-            loss = criterion(output, target)
+            # Scale loss by 1/grad_accum_steps so accumulated gradients average to the
+            # per-batch loss scale; optimizer.step() only fires every grad_accum_steps batches.
+            loss = criterion(output, target) / self.grad_accum_steps
             loss.backward()
-            optimizer.step()
+            if (batch_idx + 1) % self.grad_accum_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
 
             running_loss += loss.item()
             _, predicted = torch.max(output.data, 1)
@@ -231,6 +339,11 @@ class EfficientNetB4GradualUnfreezingTrainer:
             current_loss = running_loss / (batch_idx + 1)
             current_acc = 100. * correct / total
             pbar.set_postfix({'Loss': f'{current_loss:.4f}', 'Acc': f'{current_acc:.2f}%'})
+
+        # Flush gradients from a trailing partial accumulation window
+        if len(train_loader) % self.grad_accum_steps != 0:
+            optimizer.step()
+            optimizer.zero_grad()
 
         epoch_loss = running_loss / len(train_loader)
         epoch_acc = 100. * correct / total
@@ -499,6 +612,10 @@ class EfficientNetB4GradualUnfreezingTrainer:
 
     def train(self):
         """Full training pipeline: macro-F1 model selection, resume support, per-epoch last checkpoint."""
+        # Fresh-start reproducibility: seed every RNG before dataloaders/models are built.
+        # (The resume path below restores saved RNG state instead.)
+        set_seed(self.seed)
+
         train_loader, val_loader, test_loader = self.create_dataloaders()
         model = self.build_model()
         criterion = self._build_criterion()
@@ -509,11 +626,21 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print("=" * 60)
         print(f"Model: EfficientNet-B4")
         print(f"Dataset: HAM10000")
+        print(f"Image size: {self.image_size}x{self.image_size}")
+        print(f"Random seed: {self.seed}")
         print(f"Training samples: {len(train_loader.dataset)}")
         print(f"Validation samples: {len(val_loader.dataset)}")
         print(f"Test samples: {len(test_loader.dataset)}")
-        print(f"\nSampler: {self.sampler_mode} WeightedRandomSampler")
-        print(f"Loss: {self.loss_mode}")
+        print(f"\nImbalance strategy: {self.imbalance_strategy} (single mechanism)")
+        if self.imbalance_strategy == 'sampler_only':
+            print(f"    Sampler: {self.sampler_mode} WeightedRandomSampler; loss: plain CE (label_smoothing={self.label_smoothing})")
+        elif self.imbalance_strategy == 'loss_only':
+            print(f"    Sampler: none (plain shuffle); loss: weighted CE (1/sqrt(count), mean-normalized)")
+        elif self.imbalance_strategy == 'focal':
+            alpha_desc = "weighted alpha (1/sqrt(count), mean-normalized)" if self.loss_mode == 'weighted_ce' else "no per-class alpha"
+            print(f"    Sampler: none (plain shuffle); loss: FocalLoss(gamma={self.focal_gamma}) with {alpha_desc}")
+        else:
+            print(f"    Sampler: {self.sampler_mode} WeightedRandomSampler + weighted CE (stacked, comparison only)")
         print(f"Model selection: Validation Macro-F1")
         print(f"Maximum epochs: {self.num_epochs}")
         print(f"Early stopping patience: {self.early_stop_patience}")
@@ -526,19 +653,18 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print(f"    Resume: efficientnetb4_last_checkpoint.pth")
         print("=" * 60)
 
-        if self.loss_mode == 'weighted_ce':
-            print(f"\nLoss mode: {self.loss_mode}")
-            print("Class weights (1/sqrt(count), mean-normalized to ~1.0):")
+        if hasattr(self, 'class_weights'):
+            print(f"\nClass weights / focal alpha (1/sqrt(count), mean-normalized to ~1.0):")
             for name, w in zip(self.class_names, self.class_weights.cpu().numpy()):
                 print(f"    {name}: {w:.4f}")
-        else:
-            print(f"\nLoss mode: {self.loss_mode} (plain CrossEntropyLoss, no class weights)")
 
         # Initial optimizer (only head)
-        optimizer = optim.Adam(model.classifier.parameters(), lr=self.learning_rate)
+        optimizer = optim.AdamW(model.classifier.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
 
+        # Scheduler tracks the same metric used for model selection: val Macro-F1 (mode='max').
+        # val_loss is dominated by the majority class on this imbalanced dataset and can diverge.
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-7
+            optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-7
         )
 
         history = {
@@ -576,12 +702,15 @@ class EfficientNetB4GradualUnfreezingTrainer:
 
             ckpt_loss = checkpoint.get('loss_mode')
             ckpt_sampler = checkpoint.get('sampler_mode')
-            if ckpt_loss != self.loss_mode or ckpt_sampler != self.sampler_mode:
+            ckpt_strategy = checkpoint.get('imbalance_strategy')
+            if (ckpt_loss != self.loss_mode or ckpt_sampler != self.sampler_mode
+                    or ckpt_strategy != self.imbalance_strategy):
                 raise ValueError(
                     f"Cannot resume: checkpoint was created with loss_mode={ckpt_loss!r}, "
-                    f"sampler_mode={ckpt_sampler!r}, but this run uses loss_mode={self.loss_mode!r}, "
-                    f"sampler_mode={self.sampler_mode!r}. Refusing to silently produce a misleading "
-                    f"experiment. Delete/rename the checkpoint to start fresh."
+                    f"sampler_mode={ckpt_sampler!r}, imbalance_strategy={ckpt_strategy!r}, but this "
+                    f"run uses loss_mode={self.loss_mode!r}, sampler_mode={self.sampler_mode!r}, "
+                    f"imbalance_strategy={self.imbalance_strategy!r}. Refusing to silently produce a "
+                    f"misleading experiment. Delete/rename the checkpoint to start fresh."
                 )
 
             if checkpoint['epoch'] >= 6:
@@ -636,7 +765,7 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print("=" * 60)
         print(f"Epochs 1-4:   Train head only")
         print(f"Epochs 5+:    Train head + blocks 6-8 (unfrozen at epoch 5)")
-        print(f"Epochs 25+:   Train head + blocks 4-8 (unfrozen at epoch 25; batch size 32)")
+        print(f"Epochs 25+:   Train head + blocks 4-8 (unfrozen at epoch 25; batch size {self.batch_size})")
         print("=" * 60)
 
         start_time = time.time()
@@ -675,8 +804,8 @@ class EfficientNetB4GradualUnfreezingTrainer:
             history['lr'].append(optimizer.param_groups[0]['lr'])
             history['trainable_params'].append(trainable_params)
 
-            # Scheduler step
-            scheduler.step(val_loss)
+            # Scheduler step (tracks val Macro-F1, the same metric used for model selection)
+            scheduler.step(val_macro_f1)
 
             # ===== ENHANCED EPOCH SUMMARY =====
             print("\n" + "=" * 80)
@@ -726,6 +855,7 @@ class EfficientNetB4GradualUnfreezingTrainer:
                 'python_rng_state': random.getstate(),
                 'loss_mode': self.loss_mode,
                 'sampler_mode': self.sampler_mode,
+                'imbalance_strategy': self.imbalance_strategy,
             }, 'efficientnetb4_last_checkpoint.pth')
 
             # ===== TRAINING METRICS (updated at the end of every completed epoch) =====
@@ -736,6 +866,7 @@ class EfficientNetB4GradualUnfreezingTrainer:
                 'current_epoch': epoch + 1,
                 'loss_mode': self.loss_mode,
                 'sampler_mode': self.sampler_mode,
+                'imbalance_strategy': self.imbalance_strategy,
             }, 'efficientnetb4_training_metrics.pth')
 
             # ===== EARLY STOPPING (monitors validation Macro-F1) =====
@@ -889,12 +1020,13 @@ class EfficientNetB4GradualUnfreezingTrainer:
         print("=" * 60)
         print(f"Model: EfficientNet-B4 (ImageNet pretrained)")
         print(f"Dataset: HAM10000 | Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
-        print(f"Batch size: {self.batch_size} | Learning rate: {self.learning_rate} | Max epochs: {self.num_epochs}")
-        print(f"Optimizer: Adam | Scheduler: ReduceLROnPlateau(factor=0.5, patience=5, min_lr=1e-7)")
-        print(f"Sampler: {self.sampler_mode} WeightedRandomSampler | Loss: {self.loss_mode}")
+        print(f"Image size: {self.image_size}x{self.image_size}")
+        print(f"Batch size: {self.batch_size} | Grad accum: {self.grad_accum_steps} (effective batch {self.batch_size * self.grad_accum_steps}) | Learning rate: {self.learning_rate} | Max epochs: {self.num_epochs}")
+        print(f"Optimizer: AdamW (weight_decay={self.weight_decay}) | Scheduler: ReduceLROnPlateau(factor=0.5, patience=5, min_lr=1e-7) on val Macro-F1 (mode='max')")
+        print(f"Imbalance strategy: {self.imbalance_strategy} (loss_mode={self.loss_mode}, sampler_mode={self.sampler_mode}) | Label smoothing: {self.label_smoothing}")
         print(f"Unfreezing: head (epochs 1-4) → +blocks 6-8 (epoch 5+) → +blocks 4-5 (epoch 25+)")
         print(f"Model selection: Validation Macro-F1 | Early stop patience: {self.early_stop_patience}")
-        print(f"Random seed: none set (identical conditions for both experiments)")
+        print(f"Random seed: {self.seed}")
         print(f"Class order: {self.class_names}")
         print(f"Best validation Macro F1: {best_macro_f1:.4f} @ epoch {best_epoch}")
         print("=" * 60)
@@ -904,6 +1036,12 @@ class EfficientNetB4GradualUnfreezingTrainer:
             # experiment identity (requirements 12 & 18)
             'loss_mode': self.loss_mode,
             'sampler_mode': self.sampler_mode,
+            'imbalance_strategy': self.imbalance_strategy,
+            'image_size': self.image_size,
+            'seed': self.seed,
+            'grad_accum_steps': self.grad_accum_steps,
+            'weight_decay': self.weight_decay,
+            'label_smoothing': self.label_smoothing,
             'num_epochs': self.num_epochs,
             'early_stop_patience': self.early_stop_patience,
             'learning_rate': self.learning_rate,
@@ -949,11 +1087,8 @@ if __name__ == "__main__":
         resume_path = None
     trainer = EfficientNetB4GradualUnfreezingTrainer(
         data_dir='HAM10000_split/train',
-        batch_size=32,
         num_epochs=50,
         learning_rate=0.001,
-        sampler_mode='sqrt',
-        loss_mode='weighted_ce',
         resume_checkpoint=resume_path
     )
     model, history, metrics = trainer.train()

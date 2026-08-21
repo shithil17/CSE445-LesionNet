@@ -4,8 +4,15 @@ import random
 import warnings
 from typing import Dict, List
 
+import numpy as np
+import torch
 from torchvision import transforms
 from PIL import Image
+
+
+# NOTE: Not part of the active training pipeline — EfficientNetB4_HAM10K.py trains on the raw
+# HAM10000_split/train with on-the-fly augmentation. This offline balanced-dataset builder is
+# retained for reference/experimentation only.
 
 
 class HAM10000AugmentorFromTable:
@@ -28,7 +35,12 @@ class HAM10000AugmentorFromTable:
         for c in self.class_names:
             os.makedirs(os.path.join(self.output_dir, c), exist_ok=True)
 
+        # Seed Python's random, numpy, and torch: torchvision's RandomRotation /
+        # RandomAffine / RandomResizedCrop draw from torch's RNG internally, so seeding
+        # only `random` does not make the augmented output reproducible.
         random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
         # SKINC-NET target counts (Table 2 as per your script)
         self.target_counts = {
