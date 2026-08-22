@@ -1,26 +1,26 @@
 """
-EXP-B4-01-NORM-FINETUNE — EfficientNet-B4 fine-tuning experiment on HAM10000.
+EfficientNet-B4 / EfficientNetV2-S fine-tuning experiment on HAM10000.
 
 The training recipe is the KNOWN-GOOD recipe (val Macro-F1 ~0.773, test Macro-F1
 (TTA) ~0.750) restored as the shared baseline for the image-only vs image+metadata
 comparison:
-  - Correct ImageNet normalization: mean/std come from the torchvision B4 weights
-    metadata (``EfficientNet_B4_Weights.IMAGENET1K_V1.transforms()``), applied
+  - Correct ImageNet normalization: mean/std come from the active torchvision
+    weights metadata, applied
     identically to train / validation / test.
   - Aspect-ratio-preserving resize + crop instead of blindly stretching to 380x380:
       train: Resize(shorter side) -> RandomResizedCrop(380) -> geometric aug ->
              color aug -> ToTensor -> Normalize
       val/test: Resize(shorter side) -> CenterCrop(380) -> ToTensor -> Normalize
-  - Discriminative learning rates: head 1e-3, blocks 6-8 = head * 0.1 (1e-4),
-    blocks 4-5 = head * 0.05 (5e-5) — the LRs that worked in the 0.66 -> 0.77
+  - Discriminative learning rates: head 1e-3, early-unfreeze blocks = head *
+    0.1 (1e-4), stage-2 blocks = head * 0.05 (5e-5).
     journey (defaults derived from lr_head, never hardcoded).
   - ReduceLROnPlateau (mode='max', factor=0.5, patience=5, min_lr=1e-7) on the
     validation Macro-F1 — the scheduler that produced the known-good results.
-  - Gradual unfreezing: head only (epochs 1-5), + blocks 6-8 fixed at epoch 6
-    (consistently worked), blocks 4-5 plateau-gated (fires once after
+  - Gradual unfreezing: head only (epochs 1-5), then the active backbone's
+    early-unfreeze blocks at epoch 6; stage-2 blocks are plateau-gated (fires once after
     stage2_unfreeze_patience epochs without a val Macro-F1 improvement, with
-    BatchNorm running stats in those blocks frozen to eval mode). Blocks 0-3 stay
-    frozen for the whole experiment.
+    BatchNorm running stats in those blocks frozen to eval mode). The active
+    backbone's configured frozen blocks stay frozen for the whole experiment.
   - AMP (fp16 autocast + GradScaler) for the RTX 4050 laptop GPU.
   - Conservative augmentation with the correct ordering (crop/geometric -> color ->
     ToTensor -> Normalize -> optional mild RandomErasing).
@@ -35,14 +35,15 @@ comparison:
   - Opt-in Phase-5 improvements: use_mixup / use_cutmix (soft-target focal),
     use_multiscale_tta (second-scale TTA at tta_second_scale px).
 
-Metadata fusion experiment (EXP-B4-META-01, opt-in via use_metadata=True):
+Metadata fusion experiment (backbone-specific ID, opt-in via use_metadata=True):
   - Leakage-safe preprocessing of HAM10000 metadata (age / sex / localization)
     fitted on the TRAINING split only; validation/test are transformed with the
     fitted state and can never alter it.
-  - Image branch stays EfficientNet-B4; a small metadata MLP
+  - Image branch stays the selected EfficientNet backbone; a small metadata MLP
     (Linear(meta_dim -> 64) -> ReLU -> Dropout(0.10) -> Linear(64 -> 32)) produces a
     32-d embedding that is concatenated with the pooled image features before the
-    classifier (input 1792 + 32). TTA reuses the metadata embedding across image views.
+    classifier (input feature_dim + 32, printed from the instantiated model). TTA
+    reuses the metadata embedding across image views.
   - use_metadata=False keeps the exact image-only baseline (no metadata dependency
     anywhere in the model path).
 
@@ -54,9 +55,9 @@ The lesion-level train/val/test split (seed 42; lesions never cross split
 boundaries) is defined by split_ham10000.py and is NOT touched here — this script
 only consumes HAM10000_split/{train,val,test}.
 
-Run from the Model/ directory:
-    ../.venv/bin/python EfficientNetB4_HAM10K.py                     # image-only baseline
-    ../.venv/bin/python EfficientNetB4_HAM10K.py --use-metadata      # image + metadata
+Run from any directory (outputs are written beside this script):
+    .venv/bin/python 'Model/Efficientnetv2s/Experiment 1/EfficientNetV2S_HAM10K.py'
+    .venv/bin/python 'Model/Efficientnetv2s/Experiment 1/EfficientNetV2S_HAM10K.py' --backbone b4
 """
 
 import csv
@@ -89,15 +90,73 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, models, transforms
 from tqdm import tqdm
 
-EXPERIMENT_ID = "EXP-B4-01-NORM-FINETUNE"    # image-only baseline (default)
-METADATA_EXPERIMENT_ID = "EXP-B4-META-01"    # image + metadata fusion (opt-in)
-DEFAULT_METADATA_CSV = "../Dataset/HAM10000_groundtruth.csv"
+EXPERIMENT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.dirname(os.path.dirname(EXPERIMENT_DIR))
+REPO_DIR = os.path.dirname(MODEL_DIR)
+DEFAULT_TRAIN_DATA_DIR = os.path.join(MODEL_DIR, "HAM10000_split", "train")
+DEFAULT_VAL_DATA_DIR = os.path.join(MODEL_DIR, "HAM10000_split", "val")
+DEFAULT_TEST_DATA_DIR = os.path.join(MODEL_DIR, "HAM10000_split", "test")
 
-# ImageNet statistics associated with the B4 weights themselves — not hardcoded.
+EXPERIMENT_ID_B4 = "EXP-B4-01-NORM-FINETUNE"
+METADATA_EXPERIMENT_ID_B4 = "EXP-B4-META-01"
+EXPERIMENT_ID_V2S = "EXP-V2S-01-FINETUNE"
+METADATA_EXPERIMENT_ID_V2S = "EXP-V2S-META-01"
+DEFAULT_METADATA_CSV = os.path.join(REPO_DIR, "Dataset", "HAM10000_groundtruth.csv")
+
+# Supplied comparable image-only B4 result. ECE and epoch duration were not
+# preserved with that result, so the first V2-S run reports them as unavailable.
+B4_IMAGE_ONLY_BASELINE = {
+    "val_macro_f1": 0.7729,
+    "test_tta_macro_f1": 0.7495,
+    "ece_before_temperature": None,
+    "ece_after_temperature": None,
+    "seconds_per_epoch": None,
+}
+
+# ImageNet statistics are selected from the active backbone's weights — never hardcoded.
 _B4_WEIGHTS = models.EfficientNet_B4_Weights.IMAGENET1K_V1
-_WEIGHTS_TRANSFORMS = _B4_WEIGHTS.transforms()
-IMAGENET_MEAN = list(_WEIGHTS_TRANSFORMS.mean)
-IMAGENET_STD = list(_WEIGHTS_TRANSFORMS.std)
+_V2S_WEIGHTS = models.EfficientNet_V2_S_Weights.IMAGENET1K_V1
+BACKBONE_CONFIGS = {
+    "b4": {
+        "display_name": "EfficientNet-B4",
+        "weights": _B4_WEIGHTS,
+        "factory": models.efficientnet_b4,
+        "experiment_id": EXPERIMENT_ID_B4,
+        "metadata_experiment_id": METADATA_EXPERIMENT_ID_B4,
+        "checkpoint_prefix": "efficientnetb4",
+        "frozen_indices": [0, 1, 2, 3],
+        "early_unfreeze_indices": [6, 7, 8],
+        "stage2_unfreeze_indices": [4, 5],
+    },
+    "v2s": {
+        "display_name": "EfficientNetV2-S",
+        "weights": _V2S_WEIGHTS,
+        "factory": models.efficientnet_v2_s,
+        "experiment_id": EXPERIMENT_ID_V2S,
+        "metadata_experiment_id": METADATA_EXPERIMENT_ID_V2S,
+        "checkpoint_prefix": "efficientnetv2s",
+        # Verified with torchvision 0.28.0: features has stem, 6 stages, head.
+        "frozen_indices": [0, 1, 2],
+        "early_unfreeze_indices": [5, 6, 7],
+        "stage2_unfreeze_indices": [3, 4],
+    },
+}
+
+
+def verify_backbone_configs():
+    """Runnable architecture guard: validates each mapping without downloading weights."""
+    for backbone, config in BACKBONE_CONFIGS.items():
+        model = config['factory'](weights=None)
+        feature_types = [(i, type(module).__name__) for i, module in enumerate(model.features)]
+        required = (config['frozen_indices'] + config['early_unfreeze_indices']
+                    + config['stage2_unfreeze_indices'])
+        assert max(required) < len(model.features), (
+            f"{backbone}: mapping {required} exceeds features length {len(model.features)}"
+        )
+        print(f"{backbone}: features len={len(model.features)}; {feature_types}; "
+              f"classifier in_features={model.classifier[1].in_features}; "
+              f"frozen={config['frozen_indices']}; early={config['early_unfreeze_indices']}; "
+              f"stage2={config['stage2_unfreeze_indices']}")
 
 
 def set_seed(seed):
@@ -156,7 +215,7 @@ class FocalLoss(nn.Module):
 
 
 class HAM10000MetadataPreprocessor:
-    """Leakage-safe metadata encoder for EXP-B4-META-01 (age / sex / localization).
+    """Leakage-safe metadata encoder for the opt-in metadata experiment (age / sex / localization).
 
     fit() MUST be called with TRAINING metadata records only — it computes the age
     median/mean/std and the sex + localization vocabularies. transform() only
@@ -384,8 +443,8 @@ class HAM10000Dataset(Dataset):
         return image, self.metadata_tensors[idx].float(), target
 
 
-class EfficientNetB4FinetuneTrainer:
-    """EfficientNet-B4 with correct ImageNet preprocessing, aspect-preserving
+class EfficientNetFinetuneTrainer:
+    """Selected EfficientNet backbone with correct ImageNet preprocessing, aspect-preserving
     geometry, discriminative LRs and gradual unfreezing (restored known-good recipe).
 
     Key arguments (everything else has a sensible default for this experiment):
@@ -395,12 +454,12 @@ class EfficientNetB4FinetuneTrainer:
       - batch_size=16, grad_accum_steps=1 (fallback 8 + 2 keeps effective 16)
       - loss_mode: 'focal' (default) | 'weighted_ce' | 'ce'  (imbalance ablation)
       - lr_head=1e-3: peak head LR (the value that worked in the 0.66 -> 0.77
-        journey). lr_blocks_6_8 / lr_blocks_4_5 default to lr_head * 0.1 /
+        journey). lr_early_unfreeze / lr_stage2_unfreeze default to lr_head * 0.1 /
         lr_head * 0.05 (never hardcoded); pass explicit values to override.
       - scheduler: ReduceLROnPlateau(mode='max', factor=0.5, patience=5,
         min_lr=1e-7) on the validation Macro-F1, stepped at the end of each
         validation phase (no warmup/cosine — that experiment is closed).
-      - Unfreezing: head (epochs 1-5), + blocks 6-8 fixed at epoch 6, blocks 4-5
+      - Unfreezing: head (epochs 1-5), then backbone-specific early blocks at epoch 6, stage-2 blocks
         plateau-gated via stage2_unfreeze_patience (default 4) epochs without a
         val Macro-F1 improvement, fires once, BatchNorm running stats in blocks
         4-5 frozen to eval mode on firing (affine params stay trainable).
@@ -409,9 +468,9 @@ class EfficientNetB4FinetuneTrainer:
       - use_ensemble=True: F1-weighted averaging of the top-K best checkpoints;
         used on the test set only if it beats the single best model on VALIDATION
         (the decision never looks at test data). keep_top_k_checkpoints (default 3).
-      - resume_checkpoint: efficientnetb4_last_checkpoint.pth path or None
-      - use_metadata=False: image-only baseline (EXP-B4-01-NORM-FINETUNE).
-        True -> image + metadata fusion (EXP-B4-META-01): HAM10000 metadata is
+      - resume_checkpoint: backbone-namespaced last-checkpoint path or None
+      - use_metadata=False: image-only baseline for the selected backbone.
+        True -> image + metadata fusion: HAM10000 metadata is
         preprocessed leakage-safely (train-only fit) and fused via a small MLP.
       - use_mixup / use_cutmix: opt-in Phase-5 augmentation (soft-target focal;
         both on -> one picked randomly per batch)
@@ -421,6 +480,7 @@ class EfficientNetB4FinetuneTrainer:
     def __init__(
         self,
         data_dir,
+        backbone='v2s',
         val_data_dir='HAM10000_split/val',
         test_data_dir='HAM10000_split/test',
         experiment_id=None,
@@ -434,8 +494,8 @@ class EfficientNetB4FinetuneTrainer:
         focal_gamma=2.0,
         weight_decay=1e-4,
         lr_head=1e-3,
-        lr_blocks_6_8=None,
-        lr_blocks_4_5=None,
+        lr_early_unfreeze=None,
+        lr_stage2_unfreeze=None,
         stage2_unfreeze_patience=4,
         use_amp=True,
         use_random_erasing=False,
@@ -451,6 +511,10 @@ class EfficientNetB4FinetuneTrainer:
         use_multiscale_tta=False,
         tta_second_scale=456,
     ):
+        if backbone not in BACKBONE_CONFIGS:
+            raise ValueError(
+                f"Unknown backbone: {backbone!r}. Supported: {sorted(BACKBONE_CONFIGS)}."
+            )
         if loss_mode not in ('ce', 'weighted_ce', 'focal'):
             raise ValueError(
                 f"Unknown loss_mode: {loss_mode!r}. Supported: 'ce', 'weighted_ce', 'focal'."
@@ -474,13 +538,29 @@ class EfficientNetB4FinetuneTrainer:
             print("NOTE: both use_mixup and use_cutmix are enabled — one is picked "
                   "randomly per batch (standard practice).")
 
+        self.backbone = backbone
+        self._backbone_config = BACKBONE_CONFIGS[backbone]
+        self.backbone_name = self._backbone_config['display_name']
+        self.weights = self._backbone_config['weights']
+        self._weights_transforms = self.weights.transforms()
+        self.imagenet_mean = list(self._weights_transforms.mean)
+        self.imagenet_std = list(self._weights_transforms.std)
+        self.checkpoint_prefix = self._backbone_config['checkpoint_prefix']
+        self._frozen_block_indices = self._backbone_config['frozen_indices']
+        self._early_unfreeze_indices = self._backbone_config['early_unfreeze_indices']
+        self._stage2_unfreeze_indices = self._backbone_config['stage2_unfreeze_indices']
+        self._early_blocks_label = self._format_blocks(self._early_unfreeze_indices)
+        self._stage2_blocks_label = self._format_blocks(self._stage2_unfreeze_indices)
+        self._frozen_blocks_label = self._format_blocks(self._frozen_block_indices)
+
         self.data_dir = data_dir
         self.val_data_dir = val_data_dir
         self.test_data_dir = test_data_dir
         self.use_metadata = use_metadata
         self.metadata_csv = metadata_csv
         self.experiment_id = experiment_id or (
-            METADATA_EXPERIMENT_ID if use_metadata else EXPERIMENT_ID
+            self._backbone_config['metadata_experiment_id'] if use_metadata
+            else self._backbone_config['experiment_id']
         )
         self.batch_size = batch_size
         self.grad_accum_steps = grad_accum_steps
@@ -492,8 +572,12 @@ class EfficientNetB4FinetuneTrainer:
         self.focal_gamma = focal_gamma
         self.weight_decay = weight_decay
         self.lr_head = lr_head
-        self.lr_blocks_6_8 = lr_blocks_6_8 if lr_blocks_6_8 is not None else lr_head * 0.1
-        self.lr_blocks_4_5 = lr_blocks_4_5 if lr_blocks_4_5 is not None else lr_head * 0.05
+        self.lr_early_unfreeze = (
+            lr_early_unfreeze if lr_early_unfreeze is not None else lr_head * 0.1
+        )
+        self.lr_stage2_unfreeze = (
+            lr_stage2_unfreeze if lr_stage2_unfreeze is not None else lr_head * 0.05
+        )
         self.stage2_unfreeze_patience = stage2_unfreeze_patience
         self.use_amp = use_amp and torch.cuda.is_available()
         self.use_random_erasing = use_random_erasing
@@ -523,6 +607,15 @@ class EfficientNetB4FinetuneTrainer:
         self.preprocessor = None       # HAM10000MetadataPreprocessor (metadata mode)
         self.metadata_dim = 0
         self._fresh_preprocessor_state = None  # JSON snapshot for leak/resume checks
+
+    @staticmethod
+    def _format_blocks(indices):
+        if indices == list(range(indices[0], indices[-1] + 1)):
+            return f"blocks {indices[0]}-{indices[-1]}"
+        return "blocks " + ", ".join(str(i) for i in indices)
+
+    def _checkpoint_path(self, suffix):
+        return f"{self.checkpoint_prefix}_{suffix}"
 
     # ------------------------------------------------------------------ data
 
@@ -561,7 +654,7 @@ class EfficientNetB4FinetuneTrainer:
                 brightness=0.15, contrast=0.15, saturation=0.15, hue=0.02,
             ),
             transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            transforms.Normalize(self.imagenet_mean, self.imagenet_std),
         ])
         if self.use_random_erasing:
             train_transform.transforms.append(
@@ -572,7 +665,7 @@ class EfficientNetB4FinetuneTrainer:
             transforms.Resize(self.eval_resize),  # int -> shorter side, aspect preserved
             transforms.CenterCrop(self.image_size),
             transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            transforms.Normalize(self.imagenet_mean, self.imagenet_std),
         ])
         return train_transform, eval_transform
 
@@ -710,7 +803,7 @@ class EfficientNetB4FinetuneTrainer:
 
         preprocessor.save("metadata_preprocessor_state.json")
         print("\n" + "=" * 60)
-        print("METADATA PREPROCESSING (EXP-B4-META-01)")
+        print(f"METADATA PREPROCESSING ({self.experiment_id})")
         print("=" * 60)
         print("Metadata preprocessing:")
         print(f"    Age median: {preprocessor.age_median:.4f}")
@@ -737,21 +830,32 @@ class EfficientNetB4FinetuneTrainer:
     # ------------------------------------------------------------------ model
 
     def build_model(self):
-        """Image-only path (default): EfficientNetB4 + Dropout(0.2) + Linear(1792, 7)
-        — literal mirror of the architecture the deployment checkpoint
-        (efficientnetb4_classifier.pth) uses.
+        """Image-only path: selected EfficientNet + Dropout(0.2) + Linear(feature_dim, 7).
 
-        Metadata path (use_metadata=True): same EfficientNet-B4 image branch plus a
+        Metadata path (use_metadata=True): same selected image branch plus a
         small metadata MLP (Linear(meta_dim -> 64) -> ReLU -> Dropout(0.10) ->
         Linear(64 -> 32)); the 32-d embedding is concatenated with the pooled image
-        features, so the final classifier receives 1792 + 32."""
-        print("\nBuilding EfficientNetB4 model...")
-        model = models.efficientnet_b4(weights=_B4_WEIGHTS)
+        features, so the final classifier receives feature_dim + 32."""
+        print(f"\nBuilding {self.backbone_name} model...")
+        model = self._backbone_config['factory'](weights=self.weights)
+        feature_types = [(i, type(module).__name__) for i, module in enumerate(model.features)]
+        print(f"{self.backbone_name} features: len={len(model.features)}; {feature_types}")
+        required_indices = (
+            self._frozen_block_indices + self._early_unfreeze_indices
+            + self._stage2_unfreeze_indices
+        )
+        if max(required_indices) >= len(model.features):
+            raise RuntimeError(
+                f"{self.backbone_name} block mapping is invalid for features length "
+                f"{len(model.features)}: frozen={self._frozen_block_indices}, "
+                f"early={self._early_unfreeze_indices}, stage2={self._stage2_unfreeze_indices}"
+            )
 
         for param in model.parameters():
             param.requires_grad = False
 
         num_features = model.classifier[1].in_features
+        print(f"{self.backbone_name} classifier feature dimension: {num_features}")
         if self.use_metadata:
             if self.metadata_dim <= 0:
                 raise RuntimeError(
@@ -809,13 +913,13 @@ class EfficientNetB4FinetuneTrainer:
         """Apply the current trainable stage for a 0-based epoch index.
 
         Head (classifier + metadata MLP): always trainable.
-        Blocks 6-8: fixed unfreeze at 1-based epoch 6 (0-based idx 5) — this fixed
+        Early-unfreeze blocks: fixed unfreeze at 1-based epoch 6 (0-based idx 5) — this fixed
         epoch consistently worked, so it stays fixed.
-        Blocks 4-5: trainable only once the plateau-gated stage-2 unfreeze has
+        Stage-2 blocks: trainable only once the plateau-gated stage-2 unfreeze has
         fired (self._stage2_unfrozen, set in train()); on firing, BatchNorm
         running stats in those blocks are pinned to eval mode (see
         _freeze_bn_stats / train_epoch).
-        Blocks 0-3 stay frozen for the entire experiment.
+        Frozen blocks stay frozen for the entire experiment.
 
         The optimizer param groups are created once up front; groups whose stage
         has not started simply have requires_grad=False, so AdamW never updates
@@ -830,10 +934,10 @@ class EfficientNetB4FinetuneTrainer:
             for param in model.metadata_mlp.parameters():
                 param.requires_grad = True
         if epoch_idx >= 5:
-            for param in self._features_params(model, [6, 7, 8]):
+            for param in self._features_params(model, self._early_unfreeze_indices):
                 param.requires_grad = True
         if self._stage2_unfrozen:
-            for param in self._features_params(model, [4, 5]):
+            for param in self._features_params(model, self._stage2_unfreeze_indices):
                 param.requires_grad = True
 
     def _freeze_bn_stats(self, model, block_indices):
@@ -854,7 +958,7 @@ class EfficientNetB4FinetuneTrainer:
 
     def _build_param_groups(self, model):
         """Explicit optimizer groups: classifier (+ metadata MLP in metadata mode)
-        / blocks 6-8 / blocks 4-5, each with its own LR. Blocks 0-3 are never part
+        / early-unfreeze blocks / stage-2 blocks, each with its own LR. Frozen blocks are never part
         of any group. Frozen groups receive no gradients (requires_grad=False) and
         are therefore never updated."""
         classifier_params = list(model.classifier.parameters())
@@ -868,15 +972,15 @@ class EfficientNetB4FinetuneTrainer:
                 'weight_decay': self.weight_decay,
             },
             {
-                'name': 'blocks 6-8',
-                'params': self._features_params(model, [6, 7, 8]),
-                'lr': self.lr_blocks_6_8,
+                'name': self._early_blocks_label,
+                'params': self._features_params(model, self._early_unfreeze_indices),
+                'lr': self.lr_early_unfreeze,
                 'weight_decay': self.weight_decay,
             },
             {
-                'name': 'blocks 4-5',
-                'params': self._features_params(model, [4, 5]),
-                'lr': self.lr_blocks_4_5,
+                'name': self._stage2_blocks_label,
+                'params': self._features_params(model, self._stage2_unfreeze_indices),
+                'lr': self.lr_stage2_unfreeze,
                 'weight_decay': self.weight_decay,
             },
         ]
@@ -1163,6 +1267,7 @@ class EfficientNetB4FinetuneTrainer:
     def _best_state(self, model, epoch, macro_f1, val_acc, val_loss, balanced_acc, weighted_f1):
         return {
             'experiment_id': self.experiment_id,
+            'backbone': self.backbone,
             'epoch': epoch,
             'best_macro_f1': macro_f1,
             'best_val_accuracy': val_acc,
@@ -1315,7 +1420,7 @@ class EfficientNetB4FinetuneTrainer:
         disk (resume path: the in-memory list is not persisted in older
         checkpoints)."""
         entries = []
-        for path in sorted(glob.glob('efficientnetb4_best_model_epoch*.pth')):
+        for path in sorted(glob.glob(self._checkpoint_path('best_model_epoch*.pth'))):
             try:
                 ckpt = torch.load(path, map_location='cpu', weights_only=False)
             except Exception:
@@ -1330,7 +1435,7 @@ class EfficientNetB4FinetuneTrainer:
         self._trim_checkpoints()
 
     def _eligible_ensemble_members(self):
-        """Once the blocks-4-5 (stage-2) unfreeze has fired, ensemble membership
+        """Once the stage-2 unfreeze has fired, ensemble membership
         is restricted to checkpoints saved at/after that epoch — pre-stage-2
         checkpoints are never eligible for this ensemble."""
         if not self._stage2_unfrozen or self._stage2_epoch is None:
@@ -1356,6 +1461,12 @@ class EfficientNetB4FinetuneTrainer:
             if not os.path.exists(path):
                 continue
             checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+            checkpoint_backbone = checkpoint.get('backbone', 'b4')
+            if checkpoint_backbone != self.backbone:
+                raise ValueError(
+                    f"Ensemble checkpoint {path} has backbone={checkpoint_backbone!r}, "
+                    f"but this run uses {self.backbone!r}."
+                )
             model.load_state_dict(checkpoint['model_state_dict'])
             if use_tta:
                 probs, t, _ = self.predict_with_tta(model, loader, n_augments=n_augments)
@@ -1386,18 +1497,18 @@ class EfficientNetB4FinetuneTrainer:
     # ------------------------------------------------------------------ plotting
 
     def plot_training_curves(self, history):
-        """Training curves with the unfreeze boundaries marked (fixed blocks 6-8
-        at epoch 6, plateau-gated blocks 4-5 at the epoch it actually fired)."""
+        """Training curves with the fixed early and plateau-gated stage-2 boundaries."""
         epochs = range(1, len(history['train_loss']) + 1)
 
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
 
         ax1.plot(epochs, history['train_acc'], 'b-', label='Training Accuracy')
         ax1.plot(epochs, history['val_acc'], 'r-', label='Validation Accuracy')
-        ax1.axvline(x=6, linestyle='--', color='gray', label='Unfreeze blocks 6-8 (epoch 6)')
+        ax1.axvline(x=6, linestyle='--', color='gray',
+                    label=f'Unfreeze {self._early_blocks_label} (epoch 6)')
         if self._stage2_epoch is not None:
             ax1.axvline(x=self._stage2_epoch, linestyle='--', color='orange',
-                        label=f'Unfreeze blocks 4-5 (epoch {self._stage2_epoch})')
+                        label=f'Unfreeze {self._stage2_blocks_label} (epoch {self._stage2_epoch})')
         ax1.set_title('Training & Validation Accuracy')
         ax1.set_xlabel('Epoch')
         ax1.set_ylabel('Accuracy (%)')
@@ -1457,15 +1568,15 @@ class EfficientNetB4FinetuneTrainer:
         """Plot confusion matrix for an epoch (epoch is 1-based)"""
         self._plot_confusion_matrix(
             y_true, y_pred,
-            f'Confusion Matrix - EfficientNetB4 (Epoch {epoch})',
-            f'efficientnetb4_confusion_matrix_epoch_{epoch}.png',
+            f'Confusion Matrix - {self.backbone_name} (Epoch {epoch})',
+            f'{self.checkpoint_prefix}_confusion_matrix_epoch_{epoch}.png',
         )
 
     def plot_final_confusion_matrix(self, y_true, y_pred):
         """Plot the final confusion matrix from the best model"""
         self._plot_confusion_matrix(
             y_true, y_pred,
-            'Confusion Matrix - EfficientNetB4 (Final)',
+            f'Confusion Matrix - {self.backbone_name} (Final)',
             'confusion_matrix.png',
         )
         print("Confusion matrix saved as 'confusion_matrix.png'")
@@ -1481,7 +1592,7 @@ class EfficientNetB4FinetuneTrainer:
         plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Random')
         plt.xlabel('False Positive Rate')
         plt.ylabel('True Positive Rate')
-        plt.title('ROC Curves - EfficientNetB4')
+        plt.title(f'ROC Curves - {self.backbone_name}')
         plt.legend(loc='lower right')
         plt.grid(True)
         plt.tight_layout()
@@ -1501,7 +1612,7 @@ class EfficientNetB4FinetuneTrainer:
             plt.plot(recall, precision, label=f'{class_name} (AP={pr_auc:.3f})')
         plt.xlabel('Recall')
         plt.ylabel('Precision')
-        plt.title('Precision-Recall Curves - EfficientNetB4')
+        plt.title(f'Precision-Recall Curves - {self.backbone_name}')
         plt.legend(loc='best')
         plt.grid(True)
         plt.tight_layout()
@@ -1580,7 +1691,7 @@ class EfficientNetB4FinetuneTrainer:
         plt.plot(bin_confidences, bin_accuracies, marker='o', label='Model calibration')
         plt.xlabel('Mean Confidence')
         plt.ylabel('Accuracy')
-        plt.title(f'Calibration Curve - EfficientNetB4 (ECE={ece:.4f})')
+        plt.title(f'Calibration Curve - {self.backbone_name} (ECE={ece:.4f})')
         plt.legend()
         plt.xlim(0, 1)
         plt.ylim(0, 1)
@@ -1784,6 +1895,11 @@ class EfficientNetB4FinetuneTrainer:
             print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"PyTorch version: {torch.__version__}")
         print(f"CUDA available: {torch.cuda.is_available()}")
+        if self.device.type == "cuda":
+            free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+            print(f"GPU memory before training: {free_bytes / 2**30:.2f} GiB free / "
+                  f"{total_bytes / 2**30:.2f} GiB total; compare peak below with B4 logs")
+            torch.cuda.reset_peak_memory_stats(self.device)
         print(f"Image size: {self.image_size}x{self.image_size}")
         print(f"Batch size: {self.batch_size}")
         print(f"Grad accumulation: {self.grad_accum_steps} "
@@ -1795,8 +1911,8 @@ class EfficientNetB4FinetuneTrainer:
         print(f"Optimizer: AdamW (weight_decay={self.weight_decay})")
         print("Learning rates per parameter group (peak LRs, restored recipe):")
         for name, base in [('classifier', self.lr_head),
-                           ('blocks 6-8', self.lr_blocks_6_8),
-                           ('blocks 4-5', self.lr_blocks_4_5)]:
+                           (self._early_blocks_label, self.lr_early_unfreeze),
+                           (self._stage2_blocks_label, self.lr_stage2_unfreeze)]:
             print(f"    {name:<12} lr={base:.2e}")
         print("Scheduler: ReduceLROnPlateau(mode='max', factor=0.5, patience=5, "
               "min_lr=1e-7) on validation Macro-F1, stepped after each validation "
@@ -1814,20 +1930,20 @@ class EfficientNetB4FinetuneTrainer:
               f"-> RandomResizedCrop({self.image_size}, scale=(0.8, 1.0), ratio=(0.9, 1.1)) "
               f"-> HFlip(0.5) -> VFlip(0.5) -> Rotation(15) -> "
               f"ColorJitter(b=0.15, c=0.15, s=0.15, h=0.02) -> ToTensor -> "
-              f"Normalize(ImageNet mean={IMAGENET_MEAN}, std={IMAGENET_STD})"
+              f"Normalize(ImageNet mean={self.imagenet_mean}, std={self.imagenet_std})"
               + (" -> RandomErasing(p=0.1)" if self.use_random_erasing else "")
               + (" -> MixUp/CutMix (soft-target focal, batch-random pick)"
                  if (self.use_mixup or self.use_cutmix) else ""))
         print(f"Augmentation (val/test): aspect-preserving Resize({self.eval_resize}) "
               f"-> CenterCrop({self.image_size}) -> ToTensor -> "
-              f"Normalize(ImageNet mean={IMAGENET_MEAN}, std={IMAGENET_STD})")
+              f"Normalize(ImageNet mean={self.imagenet_mean}, std={self.imagenet_std})")
         print("Unfreezing schedule (restored recipe):")
         print("    Epochs 1-5: head")
-        print("    Epoch 6+:   head + blocks 6-8 (fixed epoch, consistently worked)")
-        print("    Blocks 4-5: plateau-gated — fires ONCE after "
+        print(f"    Epoch 6+:   head + {self._early_blocks_label} (fixed epoch, consistently worked)")
+        print(f"    {self._stage2_blocks_label}: plateau-gated — fires ONCE after "
               f"{self.stage2_unfreeze_patience} epochs without a val Macro-F1 "
               "improvement, with BN running stats frozen")
-        print("    Blocks 0-3 remain frozen")
+        print(f"    {self._frozen_blocks_label} remain frozen")
         print(f"Imbalance: plain shuffle + {self.loss_mode}")
         print(f"Model selection: validation Macro-F1 (also tracking validation accuracy)")
         print(f"Temperature scaling: Guo et al., T fitted on validation "
@@ -1858,8 +1974,8 @@ class EfficientNetB4FinetuneTrainer:
     # ------------------------------------------------------------------ main loop
 
     def train(self):
-        """Full training pipeline: gradual unfreezing (fixed blocks 6-8 @ epoch 6,
-        plateau-gated blocks 4-5), ReduceLROnPlateau on val Macro-F1, top-K
+        """Full training pipeline: gradual unfreezing (fixed early stage @ epoch 6,
+        plateau-gated stage-2), ReduceLROnPlateau on val Macro-F1, top-K
         checkpoint rotation, Macro-F1 + accuracy model selection, resume support,
         temperature scaling + val-gated F1-weighted ensemble for the final test
         evaluation."""
@@ -1868,7 +1984,7 @@ class EfficientNetB4FinetuneTrainer:
         if self.resume_checkpoint is None:
             # Fresh run: clear stale epoch-named best checkpoints from any previous
             # experiment so the top-K rotation/ensemble only covers this run.
-            for stale in glob.glob('efficientnetb4_best_model_epoch*.pth'):
+            for stale in glob.glob(self._checkpoint_path('best_model_epoch*.pth')):
                 os.remove(stale)
                 print(f"   -> Removed stale best checkpoint from a previous run: {stale}")
             self._best_checkpoints = []
@@ -1960,7 +2076,7 @@ class EfficientNetB4FinetuneTrainer:
             print(f"Resuming from epoch: {start_epoch + 1}")
             print(f"Previous best validation Macro-F1: {best_macro_f1:.4f} @ epoch {best_epoch}")
             print(f"Previous best validation accuracy: {best_val_acc:.2f}% @ epoch {best_acc_epoch}")
-            print(f"Stage-2 (blocks 4-5) unfrozen: {self._stage2_unfrozen}"
+            print(f"Stage-2 ({self._stage2_blocks_label}) unfrozen: {self._stage2_unfrozen}"
                   + (f" @ epoch {self._stage2_epoch}" if self._stage2_epoch else ""))
             print("=" * 60)
         else:
@@ -1972,7 +2088,7 @@ class EfficientNetB4FinetuneTrainer:
             self._rescan_checkpoints()
         # Re-apply stage-2 BN running-stat freeze on resume (modules are new).
         if self._stage2_unfrozen:
-            self._freeze_bn_stats(model, [4, 5])
+            self._freeze_bn_stats(model, self._stage2_unfreeze_indices)
 
         # Stage-aware trainable flags (re-applied on resume so requires_grad
         # always matches the current stage).
@@ -1984,36 +2100,36 @@ class EfficientNetB4FinetuneTrainer:
         print("Training with Gradual Unfreezing (restored recipe)")
         print("=" * 60)
         print("    Epochs 1-5: head")
-        print("    Epoch 6+:   head + blocks 6-8")
-        print(f"    Blocks 4-5: plateau-gated (after {self.stage2_unfreeze_patience} epochs "
+        print(f"    Epoch 6+:   head + {self._early_blocks_label}")
+        print(f"    {self._stage2_blocks_label}: plateau-gated (after {self.stage2_unfreeze_patience} epochs "
               f"without val Macro-F1 improvement; BN running stats frozen)")
-        print("    Blocks 0-3 remain frozen")
+        print(f"    {self._frozen_blocks_label} remain frozen")
         print("=" * 60)
 
         start_time = time.time()
         try:
             for epoch in range(start_epoch, self.num_epochs):
                 # ===== UNFREEZE TRANSITIONS =====
-                # Blocks 6-8: fixed at 1-based epoch 6 (0-based idx 5) — this fixed
+                # Early-unfreeze blocks: fixed at 1-based epoch 6 (0-based idx 5) — this fixed
                 # epoch consistently worked, so it stays fixed.
                 if epoch == 5 and not self._stage2_unfrozen:
-                    print(f"\nUNFREEZING blocks 6-8 at epoch {epoch + 1} "
-                          f"(head + blocks 6-8 from now on)...")
+                    print(f"\nUNFREEZING {self._early_blocks_label} at epoch {epoch + 1} "
+                          f"(head + {self._early_blocks_label} from now on)...")
                     self._set_trainable(model, epoch)
-                # Blocks 4-5: plateau-gated, fires ONCE — only after blocks 6-8 have
+                # Stage-2 blocks: plateau-gated, fires ONCE — only after the early blocks have
                 # had room to help and val Macro-F1 has gone stage2_unfreeze_patience
                 # epochs without improving (reuses the early-stopping patience
-                # counter; no duplicate tracking). BN running stats in blocks 4-5
+                # counter; no duplicate tracking). BN running stats in stage-2 blocks
                 # are pinned to eval mode on firing (small-batch stabilizer).
                 if (not self._stage2_unfrozen and epoch > 5
                         and patience_counter >= self.stage2_unfreeze_patience):
-                    print(f"\nUNFREEZING blocks 4-5 at epoch {epoch + 1} "
+                    print(f"\nUNFREEZING {self._stage2_blocks_label} at epoch {epoch + 1} "
                           f"(no val Macro-F1 improvement for {patience_counter} "
                           f"epochs)...")
                     self._stage2_unfrozen = True
                     self._stage2_epoch = epoch + 1
                     self._set_trainable(model, epoch)
-                    self._freeze_bn_stats(model, [4, 5])
+                    self._freeze_bn_stats(model, self._stage2_unfreeze_indices)
 
                 train_loss, train_acc = self.train_epoch(model, train_loader, criterion, optimizer)
                 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -2072,14 +2188,14 @@ class EfficientNetB4FinetuneTrainer:
                     # disk for the ensemble, delete worse ones. The canonical
                     # unqualified filename is kept as a copy of the single best
                     # so resume/external tooling is unaffected.
-                    rotating_path = f'efficientnetb4_best_model_epoch{best_epoch}.pth'
+                    rotating_path = self._checkpoint_path(f'best_model_epoch{best_epoch}.pth')
                     torch.save(best_state, rotating_path)
                     self._best_checkpoints = [
                         e for e in self._best_checkpoints if e['path'] != rotating_path]
                     self._best_checkpoints.append(
                         {'path': rotating_path, 'f1': best_macro_f1, 'epoch': best_epoch})
                     self._trim_checkpoints()
-                    torch.save(best_state, 'efficientnetb4_best_model.pth')
+                    torch.save(best_state, self._checkpoint_path('best_model.pth'))
                     print(f"SAVING MODEL -> Epoch {epoch + 1} | New Best Macro F1: "
                           f"{best_macro_f1:.4f} (+{improvement:.4f}) | Acc: {val_acc:.2f}%")
                     self.plot_confusion_matrix(val_targets, val_preds, epoch + 1)
@@ -2095,13 +2211,14 @@ class EfficientNetB4FinetuneTrainer:
                     torch.save(self._best_state(
                         model, best_acc_epoch, best_macro_f1, val_acc, val_loss,
                         val_balanced_acc, val_weighted_f1),
-                        'efficientnetb4_best_accuracy_model.pth')
+                        self._checkpoint_path('best_accuracy_model.pth'))
                     print(f"SAVING ACC-BEST MODEL -> Epoch {epoch + 1} | "
                           f"New Best Val Accuracy: {val_acc:.2f}%")
 
                 # ===== LAST CHECKPOINT (resume support; overwritten every epoch) =====
                 torch.save({
                     'experiment_id': self.experiment_id,
+                    'backbone': self.backbone,
                     'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -2124,8 +2241,8 @@ class EfficientNetB4FinetuneTrainer:
                     'grad_accum_steps': self.grad_accum_steps,
                     'num_epochs': self.num_epochs,
                     'lr_head': self.lr_head,
-                    'lr_blocks_6_8': self.lr_blocks_6_8,
-                    'lr_blocks_4_5': self.lr_blocks_4_5,
+                    'lr_early_unfreeze': self.lr_early_unfreeze,
+                    'lr_stage2_unfreeze': self.lr_stage2_unfreeze,
                     'seed': self.seed,
                     'use_metadata': self.use_metadata,
                     'metadata_preprocessor_state': self._preprocessor_state(),
@@ -2135,7 +2252,7 @@ class EfficientNetB4FinetuneTrainer:
                     'use_ensemble': self.use_ensemble,
                     'keep_top_k_checkpoints': self.keep_top_k_checkpoints,
                     'best_checkpoints': self._best_checkpoints,
-                }, 'efficientnetb4_last_checkpoint.pth')
+                }, self._checkpoint_path('last_checkpoint.pth'))
 
                 # ===== EARLY STOPPING (validation Macro-F1) =====
                 if patience_counter >= self.early_stop_patience:
@@ -2156,13 +2273,19 @@ class EfficientNetB4FinetuneTrainer:
         print("=" * 60)
         print(f"Total time: {total_training_time:.2f} seconds "
               f"(~{total_training_time / max(1, len(history['train_loss'])):.1f} s/epoch)")
+        if self.device.type == "cuda":
+            free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+            peak_bytes = torch.cuda.max_memory_allocated(self.device)
+            print(f"GPU memory: peak allocated {peak_bytes / 2**30:.2f} GiB; "
+                  f"current free {free_bytes / 2**30:.2f} / {total_bytes / 2**30:.2f} GiB. "
+                  "Compare this peak with the B4 baseline before changing resolution or batch size.")
         print(f"Best Validation Macro F1: {best_macro_f1:.4f} (epoch {best_epoch})")
         print(f"Best Validation Accuracy: {best_val_acc:.2f}% (epoch {best_acc_epoch})")
         if self._stage2_unfrozen:
-            print(f"Stage-2 (blocks 4-5) unfreeze fired at epoch {self._stage2_epoch}")
+            print(f"Stage-2 ({self._stage2_blocks_label}) unfreeze fired at epoch {self._stage2_epoch}")
 
         # Evaluate the best-Macro-F1 model on the held-out test set (touched at the end).
-        best_model_path = 'efficientnetb4_best_model.pth'
+        best_model_path = self._checkpoint_path('best_model.pth')
         if not os.path.exists(best_model_path):
             raise FileNotFoundError(f"{best_model_path} not found — cannot evaluate.")
         best_checkpoint = torch.load(best_model_path, map_location='cpu', weights_only=False)
@@ -2342,7 +2465,7 @@ class EfficientNetB4FinetuneTrainer:
         print("\n" + "=" * 60)
         print(f"EXPERIMENT CONFIGURATION (as run) — {self.experiment_id}")
         print("=" * 60)
-        print(f"Model: EfficientNet-B4 (ImageNet pretrained, correct ImageNet normalization)")
+        print(f"Model: {self.backbone_name} (ImageNet pretrained, correct ImageNet normalization)")
         print(f"Dataset: HAM10000 (lesion-level split, unchanged) | "
               f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | "
               f"Test: {len(test_loader.dataset)}")
@@ -2352,15 +2475,15 @@ class EfficientNetB4FinetuneTrainer:
               f"(effective batch {self.batch_size * self.grad_accum_steps}) | "
               f"Max epochs: {self.num_epochs}")
         print(f"Optimizer: AdamW (weight_decay={self.weight_decay}) | "
-              f"LRs: head {self.lr_head:.1e}, blocks 6-8 {self.lr_blocks_6_8:.1e}, "
-              f"blocks 4-5 {self.lr_blocks_4_5:.1e}")
+              f"LRs: head {self.lr_head:.1e}, {self._early_blocks_label} {self.lr_early_unfreeze:.1e}, "
+              f"{self._stage2_blocks_label} {self.lr_stage2_unfreeze:.1e}")
         print(f"Scheduler: ReduceLROnPlateau(mode='max', factor=0.5, patience=5, "
               f"min_lr=1e-7) on val Macro-F1 | Loss: {self.loss_mode} | AMP: {self.use_amp}")
-        print(f"Unfreezing: head (epochs 1-5) -> +blocks 6-8 (epoch 6+) -> +blocks 4-5 "
+        print(f"Unfreezing: head (epochs 1-5) -> +{self._early_blocks_label} (epoch 6+) -> +{self._stage2_blocks_label} "
               f"(plateau-gated: {self.stage2_unfreeze_patience} epochs without val "
               f"Macro-F1 improvement, BN running stats frozen"
               + (f", fired @ epoch {self._stage2_epoch}" if self._stage2_epoch else "")
-              + "); blocks 0-3 frozen")
+              + f"); {self._frozen_blocks_label} frozen")
         print(f"Model selection: validation Macro-F1 (epoch {best_epoch}) | "
               f"validation accuracy (epoch {best_acc_epoch})")
         print(f"TTA: {'enabled (final evaluation only)' if self.use_tta else 'disabled'}"
@@ -2377,13 +2500,24 @@ class EfficientNetB4FinetuneTrainer:
               f"CutMix: {'on' if self.use_cutmix else 'off'}")
         print(f"Random seed: {self.seed} | Class order: {self.class_names}")
         if self.use_metadata:
-            print(f"Metadata: ENABLED ({METADATA_EXPERIMENT_ID}) — dim {self.metadata_dim}, "
+            print(f"Metadata: ENABLED ({self._backbone_config['metadata_experiment_id']}) — dim {self.metadata_dim}, "
                   f"MLP -> 64 -> 32, fusion concat(image features, metadata embedding)")
         else:
-            print(f"Metadata: disabled (image-only baseline, {EXPERIMENT_ID})")
+            print(f"Metadata: disabled (image-only baseline, {self._backbone_config['experiment_id']})")
         print(f"Best validation Macro F1: {best_macro_f1:.4f} @ epoch {best_epoch}")
         print(f"Test Macro-F1: no-TTA {no_tta_f1:.4f} -> final {tta_f1:.4f} | "
               f"Test accuracy: {final_acc:.2f}%")
+        if self.backbone == 'v2s' and not self.use_metadata:
+            seconds_per_epoch = total_training_time / max(1, len(history['train_loss']))
+            print("Backbone baseline comparison (image-only; same seed/recipe):")
+            print(f"    B4  — val Macro-F1 {B4_IMAGE_ONLY_BASELINE['val_macro_f1']:.4f}; "
+                  f"test Macro-F1 (TTA) {B4_IMAGE_ONLY_BASELINE['test_tta_macro_f1']:.4f}; "
+                  "ECE before/after temperature and seconds/epoch: not recorded")
+            print(f"    V2-S — val Macro-F1 {best_macro_f1:.4f}; test Macro-F1 (TTA) "
+                  f"{tta_f1:.4f}; ECE before/after temperature {ece_before:.4f}/{ece:.4f}"
+                  + ("; temperature FIT REJECTED (T=1.0 shipped)"
+                     if temperature_fallback_final else "")
+                  + f"; {seconds_per_epoch:.1f} s/epoch")
         if ensemble_result is not None:
             print(f"Ensemble: val F1 {ensemble_result['val_macro_f1']:.4f} | "
                   f"test F1 {ensemble_result['test_macro_f1']:.4f} | "
@@ -2393,6 +2527,7 @@ class EfficientNetB4FinetuneTrainer:
         # ===== SAVE FULL METRICS =====
         metrics = {
             'experiment_id': self.experiment_id,
+            'backbone': self.backbone,
             'loss_mode': self.loss_mode,
             'focal_gamma': self.focal_gamma,
             'image_size': self.image_size,
@@ -2402,8 +2537,8 @@ class EfficientNetB4FinetuneTrainer:
             'grad_accum_steps': self.grad_accum_steps,
             'weight_decay': self.weight_decay,
             'lr_head': self.lr_head,
-            'lr_blocks_6_8': self.lr_blocks_6_8,
-            'lr_blocks_4_5': self.lr_blocks_4_5,
+            'lr_early_unfreeze': self.lr_early_unfreeze,
+            'lr_stage2_unfreeze': self.lr_stage2_unfreeze,
             'use_amp': self.use_amp,
             'use_tta': self.use_tta,
             'use_multiscale_tta': self.use_multiscale_tta,
@@ -2453,8 +2588,9 @@ class EfficientNetB4FinetuneTrainer:
             'temperature_fallback': temperature_fallback_final,
         }
         metrics.update(report_metrics)
-        torch.save(metrics, 'efficientnetb4_training_metrics.pth')
-        print(f"Metrics saved to 'efficientnetb4_training_metrics.pth' "
+        metrics_path = self._checkpoint_path('training_metrics.pth')
+        torch.save(metrics, metrics_path)
+        print(f"Metrics saved to '{metrics_path}' "
               f"({self.experiment_id})")
 
         return model, history, metrics
@@ -2464,6 +2600,13 @@ class EfficientNetB4FinetuneTrainer:
         stale file can never silently corrupt a fresh run's results. num_epochs is
         the one exception: resuming with MORE epochs is allowed (ReduceLROnPlateau
         has no fixed schedule tail to extend); shrinking is refused."""
+        checkpoint_backbone = checkpoint.get('backbone', 'b4')
+        if checkpoint_backbone != self.backbone:
+            raise ValueError(
+                f"Cannot resume: checkpoint backbone={checkpoint_backbone!r} but this run "
+                f"uses backbone={self.backbone!r}. Checkpoints are architecture-specific; "
+                f"choose the matching --backbone or start a fresh run."
+            )
         expected = {
             'experiment_id': self.experiment_id,
             'loss_mode': self.loss_mode,
@@ -2471,10 +2614,22 @@ class EfficientNetB4FinetuneTrainer:
             'batch_size': self.batch_size,
             'grad_accum_steps': self.grad_accum_steps,
             'lr_head': self.lr_head,
-            'lr_blocks_6_8': self.lr_blocks_6_8,
-            'lr_blocks_4_5': self.lr_blocks_4_5,
             'seed': self.seed,
         }
+        checkpoint_lrs = {
+            'lr_early_unfreeze': checkpoint.get(
+                'lr_early_unfreeze', checkpoint.get('lr_blocks_6_8')),
+            'lr_stage2_unfreeze': checkpoint.get(
+                'lr_stage2_unfreeze', checkpoint.get('lr_blocks_4_5')),
+        }
+        if checkpoint_lrs != {
+            'lr_early_unfreeze': self.lr_early_unfreeze,
+            'lr_stage2_unfreeze': self.lr_stage2_unfreeze,
+        }:
+            raise ValueError(
+                f"Cannot resume: checkpoint unfreeze LRs={checkpoint_lrs} but this run uses "
+                f"early={self.lr_early_unfreeze}, stage2={self.lr_stage2_unfreeze}."
+            )
         # Old image-only checkpoints predate use_metadata -> treat missing key as False.
         # Checked FIRST so cross-mode resume failures get the most actionable message.
         if checkpoint.get('use_metadata', False) != self.use_metadata:
@@ -2507,22 +2662,28 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="EfficientNet-B4 HAM10000 trainer (image-only or image+metadata).")
+        description="EfficientNet B4/V2-S HAM10000 trainer (image-only or image+metadata).")
+    parser.add_argument("--backbone", choices=sorted(BACKBONE_CONFIGS), default="v2s",
+                        help="backbone for this experiment (default: %(default)s)")
+    parser.add_argument("--verify-backbone", action="store_true",
+                        help="print and validate the installed feature layout, then exit")
     parser.add_argument(
         "--use-metadata", action="store_true",
-        help=f"enable image+metadata fusion ({METADATA_EXPERIMENT_ID}); default is "
-             f"the image-only baseline ({EXPERIMENT_ID})")
+        help="enable image+metadata fusion for the selected backbone")
     parser.add_argument(
         "--metadata-csv", default=DEFAULT_METADATA_CSV,
         help="ground-truth CSV with metadata columns (default: %(default)s)")
     parser.add_argument("--num-epochs", type=int, default=50,
                         help="maximum epochs (default: %(default)s)")
     parser.add_argument("--lr-head", type=float, default=1e-3,
-                        help="peak head LR (default: %(default)s); blocks 6-8 = "
-                             "head*0.1, blocks 4-5 = head*0.05 unless overridden")
+                        help="peak head LR (default: %(default)s); early blocks = "
+                             "head*0.1, stage-2 blocks = head*0.05 unless overridden")
     parser.add_argument("--stage2-unfreeze-patience", type=int, default=4,
                         help="epochs without val Macro-F1 improvement before the "
-                             "blocks-4-5 unfreeze fires (default: %(default)s)")
+                             "stage-2 unfreeze fires (default: %(default)s)")
+    parser.add_argument("--resume-checkpoint", default=None,
+                        help="explicit backbone-matched last checkpoint; defaults to the "
+                             "namespaced checkpoint in this experiment directory")
     parser.add_argument("--use-ensemble", dest="use_ensemble", action="store_true",
                         default=True, help="F1-weighted top-K ensemble (default: on)")
     parser.add_argument("--no-ensemble", dest="use_ensemble", action="store_false",
@@ -2542,12 +2703,23 @@ if __name__ == "__main__":
                         help="disable test-time augmentation")
     args = parser.parse_args()
 
+    if args.verify_backbone:
+        verify_backbone_configs()
+        raise SystemExit(0)
+
+    # Keep all V2-S experiment outputs in this copied experiment directory.
+    os.chdir(EXPERIMENT_DIR)
+
     # Auto-resume when a last checkpoint exists (crash recovery); start fresh otherwise.
-    resume_path = 'efficientnetb4_last_checkpoint.pth'
+    resume_path = args.resume_checkpoint or \
+        f"{BACKBONE_CONFIGS[args.backbone]['checkpoint_prefix']}_last_checkpoint.pth"
     if not os.path.exists(resume_path):
         resume_path = None
-    trainer = EfficientNetB4FinetuneTrainer(
-        data_dir='HAM10000_split/train',
+    trainer = EfficientNetFinetuneTrainer(
+        data_dir=DEFAULT_TRAIN_DATA_DIR,
+        val_data_dir=DEFAULT_VAL_DATA_DIR,
+        test_data_dir=DEFAULT_TEST_DATA_DIR,
+        backbone=args.backbone,
         num_epochs=args.num_epochs,
         resume_checkpoint=resume_path,
         use_metadata=args.use_metadata,
