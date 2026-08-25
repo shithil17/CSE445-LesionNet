@@ -17,6 +17,7 @@ dependencies = [
     "tqdm",
     "matplotlib",
     "seaborn",
+    "timm>=1.0.28",
 ]
 
 [project.scripts]
