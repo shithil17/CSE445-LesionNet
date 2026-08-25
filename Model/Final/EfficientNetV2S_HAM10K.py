@@ -424,7 +424,6 @@ class EfficientNetFinetuneTrainer:
       - use_metadata=False by default; True enables train-only metadata fitting
         and image/metadata MLP fusion
       - use_mixup=False: optional MixUp with soft-target focal loss
-      - use_multiscale_tta=False: optional second-scale TTA
     """
 
     def __init__(
@@ -457,8 +456,6 @@ class EfficientNetFinetuneTrainer:
         use_metadata=False,
         metadata_csv=DEFAULT_METADATA_CSV,
         use_mixup=False,
-        use_multiscale_tta=False,
-        tta_second_scale=456,
     ):
         if backbone not in BACKBONE_CONFIGS:
             raise ValueError(
@@ -536,8 +533,6 @@ class EfficientNetFinetuneTrainer:
         self._temperature_fallback_ens = False
         self._temperature_source_single = None
         self._temperature_source_ens = None
-        self.use_multiscale_tta = use_multiscale_tta
-        self.tta_second_scale = tta_second_scale
 
         self._stage2_unfrozen = False
         self._stage2_epoch = None
@@ -1073,14 +1068,11 @@ class EfficientNetFinetuneTrainer:
             np.array(all_probs),
         )
 
-    def predict_with_tta(self, model, loader, n_augments=4, scales=None):
+    def predict_with_tta(self, model, loader, n_augments=4):
         """Test-time augmentation — final evaluation only, never per-epoch.
         Runs n_augments deterministic views (identity, horizontal flip, ±5°
-        rotation, optional 0.95-scale center crop) per input scale, averages the
-        LOGITS across views/scales and applies softmax once. scales=None uses
-        [self.image_size]; with use_multiscale_tta the second scale
-        (tta_second_scale px, e.g. 456) is appended so softmax probabilities are
-        averaged across both scales and the augment views.
+        rotation, optional 0.95-scale center crop) at self.image_size, averages
+        the LOGITS across views and applies softmax once.
 
         Returns (avg_probs, targets, avg_logits) — avg_logits are the
         TTA-averaged logits (temperature scaling fits/consumes these, keeping
@@ -1091,10 +1083,7 @@ class EfficientNetFinetuneTrainer:
         forward per view, since the metadata branch is view-independent)."""
         model.eval()
         n_augments = max(1, min(n_augments, 5))
-        if scales is None:
-            scales = [self.image_size]
-            if self.use_multiscale_tta:
-                scales = sorted(set(scales + [self.tta_second_scale]))
+        scales = [self.image_size]
         all_avg_probs = []
         all_targets = []
         all_avg_logits = []
@@ -1917,9 +1906,7 @@ class EfficientNetFinetuneTrainer:
         print(f"Ensemble: top-{self.keep_top_k_checkpoints} "
               f"{'on' if self.use_ensemble else 'off'} (F1-weighted, post-stage-2 "
               "members only, val-gated usage)")
-        print(f"TTA: {'on (final evaluation only)' if self.use_tta else 'off'}"
-              + (f", multi-scale (second scale {self.tta_second_scale}px)"
-                 if self.use_multiscale_tta else ""))
+        print(f"TTA: {'on (final evaluation only)' if self.use_tta else 'off'}")
         if self.use_metadata:
             p = self.preprocessor
             print(f"Metadata branch: ENABLED (fused via MLP; classifier input "
@@ -2277,21 +2264,6 @@ class EfficientNetFinetuneTrainer:
 
         single_val_f1 = self._score_probs(val_probs_single, val_targets_single)['macro_f1']
 
-        # ===== MULTI-SCALE TTA INCREMENTAL GAIN (opt-in) =====
-        tta_single_scale_f1 = None
-        if self.use_tta and self.use_multiscale_tta:
-            probs_ss, _, _ = self.predict_with_tta(
-                model, test_loader, scales=[self.image_size])
-            tta_single_scale_f1 = f1_score(
-                probs_ss.argmax(axis=1), test_targets, average='macro',
-                zero_division=0)
-            f1_ms = f1_score(test_probs_single.argmax(axis=1), test_targets,
-                             average='macro', zero_division=0)
-            print(f"\nTTA scale gain: single-scale ({self.image_size}px) "
-                  f"Macro-F1 {tta_single_scale_f1:.4f} -> multi-scale "
-                  f"(+{self.tta_second_scale}px) Macro-F1 {f1_ms:.4f} "
-                  f"(gain {f1_ms - tta_single_scale_f1:+.4f})")
-
         # ===== TEMPERATURE SCALING (Guo et al.) — fit T on VALIDATION =====
         print("\n" + "=" * 60)
         print("TEMPERATURE SCALING (fitted on validation, never on test)")
@@ -2458,9 +2430,7 @@ class EfficientNetFinetuneTrainer:
         print(f"Model selection: validation Macro-F1 (epoch {best_epoch}) | "
               f"validation accuracy (epoch {best_acc_epoch})")
         print(f"TTA: {'enabled (final evaluation only)' if self.use_tta else 'disabled'}"
-              + (f", multi-scale (second scale {self.tta_second_scale}px)"
-                 if self.use_multiscale_tta else "")
-              + f" | Ensemble: {'on' if self.use_ensemble else 'off'} "
+              f" | Ensemble: {'on' if self.use_ensemble else 'off'} "
               f"(top-{self.keep_top_k_checkpoints}, F1-weighted, "
               f"{'USED on test' if use_ensemble_final else 'NOT used on test (lost val gate)'})"
 + (" | Temperature scaling: on (T=1.0 — fit rejected, see fallback "
@@ -2503,8 +2473,6 @@ class EfficientNetFinetuneTrainer:
             'lr_stage2_unfreeze': self.lr_stage2_unfreeze,
             'use_amp': self.use_amp,
             'use_tta': self.use_tta,
-            'use_multiscale_tta': self.use_multiscale_tta,
-            'tta_second_scale': self.tta_second_scale,
             'use_random_erasing': self.use_random_erasing,
             'use_mixup': self.use_mixup,
             'use_ensemble': self.use_ensemble,
@@ -2657,10 +2625,6 @@ if __name__ == "__main__":
                              "(default: %(default)s)")
     parser.add_argument("--use-mixup", action="store_true",
                         help="opt-in MixUp (alpha=0.2, soft-target focal)")
-    parser.add_argument("--use-multiscale-tta", action="store_true",
-                        help="opt-in second-scale TTA (adds tta-second-scale px)")
-    parser.add_argument("--tta-second-scale", type=int, default=456,
-                        help="second TTA scale in px (default: %(default)s)")
     parser.add_argument("--no-tta", dest="use_tta", action="store_false",
                         help="disable test-time augmentation")
     args = parser.parse_args()
@@ -2693,7 +2657,5 @@ if __name__ == "__main__":
         keep_top_k_checkpoints=args.keep_top_k,
         use_tta=args.use_tta,
         use_mixup=args.use_mixup,
-        use_multiscale_tta=args.use_multiscale_tta,
-        tta_second_scale=args.tta_second_scale,
     )
     model, history, metrics = trainer.train()
