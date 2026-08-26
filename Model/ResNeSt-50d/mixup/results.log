@@ -1,0 +1,499 @@
+❯ uv run python "Model/ResNeSt-50d/ResNeSt_HAM10K.py" --use-mixup
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Training samples: 7221
+Validation samples: 787
+Test samples: 2007
+Classes (ImageFolder order): ['AKIEC', 'BCC', 'BKL', 'DF', 'MEL', 'NV', 'VASC']
+Train class counts: {'AKIEC': np.int64(234), 'BCC': np.int64(375), 'BKL': np.int64(792), 'DF': np.int64(88), 'MEL': np.int64(802), 'NV': np.int64(4827), 'VASC': np.int64(103)}
+
+Building ResNeSt-50d model...
+resnest50d: named_children = ['conv1', 'bn1', 'act1', 'maxpool', 'layer1', 'layer2', 'layer3', 'layer4', 'global_pool', 'fc']
+resnest50d: num_features = 2048
+resnest50d: frozen=['conv1', 'bn1', 'layer1']; early=['layer4']; stage2=['layer2', 'layer3']
+ResNeSt-50d feature dimension: 2048
+Total parameters: 25,448,583
+
+========================================================================
+EXPERIMENT: EXP-RESNEST-01-FINETUNE
+========================================================================
+Device: cuda
+GPU: NVIDIA GeForce RTX 4050 Laptop GPU
+PyTorch version: 2.13.0+cu130
+CUDA available: True
+GPU memory before training: 5.44 GiB free / 5.66 GiB total
+Image size: 380x380
+Batch size: 16
+Grad accumulation: 1 (effective batch 16)
+AMP: enabled (fp16 autocast + GradScaler)
+Seed: 42
+CuDNN: deterministic=True, benchmark=False (explicit reproducibility choice; slightly slower than benchmark mode)
+Optimizer: AdamW (weight_decay=0.0001)
+Learning rates per parameter group (peak LRs):
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+Scheduler: ReduceLROnPlateau(mode='max', factor=0.5, patience=5, min_lr=1e-7) on validation Macro-F1, stepped after each validation phase
+Loss: FocalLoss (gamma=2.0, alpha=1/sqrt(count) mean-normalized)
+Class weights / focal alpha:
+    AKIEC: 1.1233
+    BCC: 0.8873
+    BKL: 0.6106
+    DF: 1.8317
+    MEL: 0.6067
+    NV: 0.2473
+    VASC: 1.6931
+Augmentation (train): aspect-preserving Resize(434) -> RandomResizedCrop(380, scale=(0.8, 1.0), ratio=(0.9, 1.1)) -> HFlip(0.5) -> VFlip(0.5) -> Rotation(15) -> ColorJitter(b=0.15, c=0.15, s=0.15, h=0.02) -> ToTensor -> Normalize(ImageNet mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) -> MixUp (soft-target focal)
+Augmentation (val/test): aspect-preserving Resize(380) -> CenterCrop(380) -> ToTensor -> Normalize(ImageNet mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+Unfreezing schedule:
+    Epochs 1-5: head
+    Epoch 6+:   head + layer4 (fixed schedule)
+    layer2+layer3: plateau-gated — fires ONCE after 4 epochs without a val Macro-F1 improvement, with BN running stats frozen
+    conv1+bn1+layer1 remain frozen
+Imbalance: plain shuffle + focal
+Model selection: validation Macro-F1 (also tracking validation accuracy)
+Temperature scaling: Guo et al., T fitted on validation (TTA-averaged logits)
+Ensemble: top-3 on (F1-weighted, post-stage-2 members only, val-gated usage)
+TTA: on (final evaluation only)
+Metadata branch: disabled — image-only baseline (no metadata dependency in the model path)
+========================================================================
+
+No checkpoint specified → starting from epoch 1
+
+============================================================
+Training with Gradual Unfreezing
+============================================================
+    Epochs 1-5: head
+    Epoch 6+:   head + layer4
+    layer2+layer3: plateau-gated (after 4 epochs without val Macro-F1 improvement; BN running stats frozen)
+    conv1+bn1+layer1 remain frozen
+============================================================
+
+================================================================================
+EPOCH 1/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.4039 | Accuracy: 63.69%
+Validation -> Loss: 0.3840 | Accuracy: 64.29% | Macro-F1: 0.3772 | Balanced Acc: 0.4435 | Weighted F1: 0.6716
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+SAVING MODEL -> Epoch 1 | New Best Macro F1: 0.3772 (+1.3772) | Acc: 64.29%
+SAVING ACC-BEST MODEL -> Epoch 1 | New Best Val Accuracy: 64.29%
+
+================================================================================
+EPOCH 2/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.3374 | Accuracy: 67.64%
+Validation -> Loss: 0.3471 | Accuracy: 62.13% | Macro-F1: 0.4006 | Balanced Acc: 0.4814 | Weighted F1: 0.6606
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+SAVING MODEL -> Epoch 2 | New Best Macro F1: 0.4006 (+0.0235) | Acc: 62.13%
+================================================================================
+EPOCH 3/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.3326 | Accuracy: 66.54%
+Validation -> Loss: 0.3050 | Accuracy: 70.65% | Macro-F1: 0.4534 | Balanced Acc: 0.5039 | Weighted F1: 0.7194
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+SAVING MODEL -> Epoch 3 | New Best Macro F1: 0.4534 (+0.0528) | Acc: 70.65%
+SAVING ACC-BEST MODEL -> Epoch 3 | New Best Val Accuracy: 70.65%
+
+================================================================================
+EPOCH 4/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.3160 | Accuracy: 68.41%
+Validation -> Loss: 0.3055 | Accuracy: 67.09% | Macro-F1: 0.4019 | Balanced Acc: 0.4901 | Weighted F1: 0.6910
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+NO IMPROVEMENT -> Epoch 4 | Patience: 1/7
+
+================================================================================
+EPOCH 5/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.3109 | Accuracy: 69.12%
+Validation -> Loss: 0.3036 | Accuracy: 63.66% | Macro-F1: 0.3442 | Balanced Acc: 0.4356 | Weighted F1: 0.6634
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+NO IMPROVEMENT -> Epoch 5 | Patience: 2/7
+
+UNFREEZING layer4 at epoch 6 (head + layer4 from now on)...
+
+================================================================================
+EPOCH 6/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.2769 | Accuracy: 71.68%
+Validation -> Loss: 0.3161 | Accuracy: 57.56% | Macro-F1: 0.3975 | Balanced Acc: 0.4182 | Weighted F1: 0.6176
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+NO IMPROVEMENT -> Epoch 6 | Patience: 3/7
+
+================================================================================
+EPOCH 7/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.2222 | Accuracy: 75.89%
+Validation -> Loss: 0.2323 | Accuracy: 74.33% | Macro-F1: 0.5083 | Balanced Acc: 0.5430 | Weighted F1: 0.7464
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+   -> Removed resnest50d_best_model_epoch1.pth (outside top-3)
+SAVING MODEL -> Epoch 7 | New Best Macro F1: 0.5083 (+0.0549) | Acc: 74.33%
+SAVING ACC-BEST MODEL -> Epoch 7 | New Best Val Accuracy: 74.33%
+
+================================================================================
+EPOCH 8/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1985 | Accuracy: 78.12%
+Validation -> Loss: 0.2063 | Accuracy: 73.57% | Macro-F1: 0.5492 | Balanced Acc: 0.6403 | Weighted F1: 0.7515
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+   -> Removed resnest50d_best_model_epoch2.pth (outside top-3)
+SAVING MODEL -> Epoch 8 | New Best Macro F1: 0.5492 (+0.0409) | Acc: 73.57%
+
+================================================================================
+EPOCH 9/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1722 | Accuracy: 80.25%
+Validation -> Loss: 0.2103 | Accuracy: 69.25% | Macro-F1: 0.5044 | Balanced Acc: 0.5741 | Weighted F1: 0.7148
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+NO IMPROVEMENT -> Epoch 9 | Patience: 1/7
+
+================================================================================
+EPOCH 10/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1711 | Accuracy: 81.47%
+Validation -> Loss: 0.2020 | Accuracy: 72.55% | Macro-F1: 0.5355 | Balanced Acc: 0.5904 | Weighted F1: 0.7381
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+NO IMPROVEMENT -> Epoch 10 | Patience: 2/7
+
+================================================================================
+EPOCH 11/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1683 | Accuracy: 81.24%
+Validation -> Loss: 0.1834 | Accuracy: 77.13% | Macro-F1: 0.6217 | Balanced Acc: 0.6586 | Weighted F1: 0.7819
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+   -> Removed resnest50d_best_model_epoch3.pth (outside top-3)
+SAVING MODEL -> Epoch 11 | New Best Macro F1: 0.6217 (+0.0724) | Acc: 77.13%
+SAVING ACC-BEST MODEL -> Epoch 11 | New Best Val Accuracy: 77.13%
+
+================================================================================
+EPOCH 12/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1558 | Accuracy: 82.94%
+Validation -> Loss: 0.2149 | Accuracy: 74.33% | Macro-F1: 0.5667 | Balanced Acc: 0.5907 | Weighted F1: 0.7599
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+NO IMPROVEMENT -> Epoch 12 | Patience: 1/7
+
+================================================================================
+EPOCH 13/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1484 | Accuracy: 83.51%
+Validation -> Loss: 0.2194 | Accuracy: 77.13% | Macro-F1: 0.5834 | Balanced Acc: 0.5955 | Weighted F1: 0.7783
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+NO IMPROVEMENT -> Epoch 13 | Patience: 2/7
+
+================================================================================
+EPOCH 14/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1436 | Accuracy: 84.17%
+Validation -> Loss: 0.2252 | Accuracy: 72.55% | Macro-F1: 0.5239 | Balanced Acc: 0.5356 | Weighted F1: 0.7423
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+NO IMPROVEMENT -> Epoch 14 | Patience: 3/7
+
+================================================================================
+EPOCH 15/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1374 | Accuracy: 84.32%
+Validation -> Loss: 0.2106 | Accuracy: 70.78% | Macro-F1: 0.5477 | Balanced Acc: 0.5828 | Weighted F1: 0.7307
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+NO IMPROVEMENT -> Epoch 15 | Patience: 4/7
+
+UNFREEZING layer2+layer3 at epoch 16 (no val Macro-F1 improvement for 4 epochs)...
+   -> BatchNorm running stats frozen in layer2+layer3 (eval mode; affine params still trainable)
+
+================================================================================
+EPOCH 16/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.2215 | Accuracy: 75.57%
+Validation -> Loss: 0.2943 | Accuracy: 71.28% | Macro-F1: 0.4669 | Balanced Acc: 0.5282 | Weighted F1: 0.7330
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+NO IMPROVEMENT -> Epoch 16 | Patience: 5/7
+
+================================================================================
+EPOCH 17/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1837 | Accuracy: 79.14%
+Validation -> Loss: 0.2450 | Accuracy: 80.43% | Macro-F1: 0.6144 | Balanced Acc: 0.5710 | Weighted F1: 0.7990
+    classifier   lr=1.00e-03
+    layer4       lr=1.00e-04
+    layer2+layer3 lr=5.00e-05
+    ReduceLROnPlateau: LR reduced (factor 0.5)
+NO IMPROVEMENT -> Epoch 17 | Patience: 6/7
+SAVING ACC-BEST MODEL -> Epoch 17 | New Best Val Accuracy: 80.43%
+
+================================================================================
+EPOCH 18/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1270 | Accuracy: 85.79%
+Validation -> Loss: 0.1860 | Accuracy: 79.92% | Macro-F1: 0.6840 | Balanced Acc: 0.6846 | Weighted F1: 0.8128
+    classifier   lr=5.00e-04
+    layer4       lr=5.00e-05
+    layer2+layer3 lr=2.50e-05
+   -> Removed resnest50d_best_model_epoch7.pth (outside top-3)
+SAVING MODEL -> Epoch 18 | New Best Macro F1: 0.6840 (+0.0623) | Acc: 79.92%
+
+================================================================================
+EPOCH 19/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1252 | Accuracy: 87.31%
+Validation -> Loss: 0.1890 | Accuracy: 80.69% | Macro-F1: 0.6255 | Balanced Acc: 0.6116 | Weighted F1: 0.8104
+    classifier   lr=5.00e-04
+    layer4       lr=5.00e-05
+    layer2+layer3 lr=2.50e-05
+NO IMPROVEMENT -> Epoch 19 | Patience: 1/7
+SAVING ACC-BEST MODEL -> Epoch 19 | New Best Val Accuracy: 80.69%
+
+================================================================================
+EPOCH 20/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1147 | Accuracy: 87.97%
+Validation -> Loss: 0.1666 | Accuracy: 80.43% | Macro-F1: 0.6729 | Balanced Acc: 0.6892 | Weighted F1: 0.8139
+    classifier   lr=5.00e-04
+    layer4       lr=5.00e-05
+    layer2+layer3 lr=2.50e-05
+NO IMPROVEMENT -> Epoch 20 | Patience: 2/7
+
+================================================================================
+EPOCH 21/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.1096 | Accuracy: 88.17%
+Validation -> Loss: 0.1690 | Accuracy: 83.86% | Macro-F1: 0.7010 | Balanced Acc: 0.7001 | Weighted F1: 0.8382
+    classifier   lr=5.00e-04
+    layer4       lr=5.00e-05
+    layer2+layer3 lr=2.50e-05
+   -> Removed resnest50d_best_model_epoch8.pth (outside top-3)
+SAVING MODEL -> Epoch 21 | New Best Macro F1: 0.7010 (+0.0170) | Acc: 83.86%
+SAVING ACC-BEST MODEL -> Epoch 21 | New Best Val Accuracy: 83.86%
+
+================================================================================
+EPOCH 22/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.0936 | Accuracy: 90.04%
+Validation -> Loss: 0.1924 | Accuracy: 80.81% | Macro-F1: 0.6609 | Balanced Acc: 0.6478 | Weighted F1: 0.8070
+    classifier   lr=5.00e-04
+    layer4       lr=5.00e-05
+    layer2+layer3 lr=2.50e-05
+NO IMPROVEMENT -> Epoch 22 | Patience: 1/7
+
+================================================================================
+EPOCH 23/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.0997 | Accuracy: 89.60%
+Validation -> Loss: 0.2192 | Accuracy: 75.48% | Macro-F1: 0.6630 | Balanced Acc: 0.6538 | Weighted F1: 0.7793
+    classifier   lr=5.00e-04
+    layer4       lr=5.00e-05
+    layer2+layer3 lr=2.50e-05
+NO IMPROVEMENT -> Epoch 23 | Patience: 2/7
+
+================================================================================
+EPOCH 24/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.0994 | Accuracy: 90.38%
+Validation -> Loss: 0.2435 | Accuracy: 71.79% | Macro-F1: 0.6429 | Balanced Acc: 0.6461 | Weighted F1: 0.7467
+    classifier   lr=5.00e-04
+    layer4       lr=5.00e-05
+    layer2+layer3 lr=2.50e-05
+NO IMPROVEMENT -> Epoch 24 | Patience: 3/7
+
+================================================================================
+EPOCH 25/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.0873 | Accuracy: 91.03%
+Validation -> Loss: 0.2325 | Accuracy: 81.45% | Macro-F1: 0.6422 | Balanced Acc: 0.6270 | Weighted F1: 0.8179
+    classifier   lr=5.00e-04
+    layer4       lr=5.00e-05
+    layer2+layer3 lr=2.50e-05
+NO IMPROVEMENT -> Epoch 25 | Patience: 4/7
+
+================================================================================
+EPOCH 26/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.0917 | Accuracy: 90.87%
+Validation -> Loss: 0.1908 | Accuracy: 83.74% | Macro-F1: 0.6709 | Balanced Acc: 0.6583 | Weighted F1: 0.8396
+    classifier   lr=5.00e-04
+    layer4       lr=5.00e-05
+    layer2+layer3 lr=2.50e-05
+NO IMPROVEMENT -> Epoch 26 | Patience: 5/7
+
+================================================================================
+EPOCH 27/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.0936 | Accuracy: 91.82%
+Validation -> Loss: 0.1681 | Accuracy: 79.54% | Macro-F1: 0.6747 | Balanced Acc: 0.6721 | Weighted F1: 0.8041
+    classifier   lr=5.00e-04
+    layer4       lr=5.00e-05
+    layer2+layer3 lr=2.50e-05
+    ReduceLROnPlateau: LR reduced (factor 0.5)
+NO IMPROVEMENT -> Epoch 27 | Patience: 6/7
+
+================================================================================
+EPOCH 28/50 SUMMARY
+================================================================================
+Training   -> Loss: 0.0793 | Accuracy: 93.69%
+Validation -> Loss: 0.2054 | Accuracy: 78.78% | Macro-F1: 0.6506 | Balanced Acc: 0.6581 | Weighted F1: 0.7997
+    classifier   lr=2.50e-04
+    layer4       lr=2.50e-05
+    layer2+layer3 lr=1.25e-05
+NO IMPROVEMENT -> Epoch 28 | Patience: 7/7
+
+EARLY STOPPING triggered at epoch 28
+
+============================================================
+TRAINING COMPLETED
+============================================================
+Total time: 2757.88 seconds (~98.5 s/epoch)
+GPU memory: peak allocated 1.99 GiB; current free 3.08 / 5.66 GiB. Compare this peak with the EfficientNetV2-S baseline before changing resolution or batch size.
+Best Validation Macro F1: 0.7010 (epoch 21)
+Best Validation Accuracy: 83.86% (epoch 21)
+Stage-2 (layer2+layer3) unfreeze fired at epoch 16
+
+============================================================
+TEMPERATURE SCALING (fitted on validation, never on test)
+============================================================
+    Temperature candidates (val ECE): T=1.0 -> 0.1168 | LBFGS T=1.0887 -> 0.1375 | grid T=0.5500 -> 0.0246. Shipping T=0.5500 (grid search).
+    Fitted T 0.5500 (grid search) improved val ECE (0.1168 -> 0.0246) — accepted.
+    Fitted T: 0.5500 (CE(logits/T, y) via LBFGS on val, TTA-averaged logits)
+    ECE before scaling: 0.0920
+    ECE after scaling : 0.0284
+    Argmax invariance : PASS (no prediction changed)
+
+============================================================
+ENSEMBLE EVALUATION (top-K best checkpoints, F1-weighted)
+============================================================
+Eligible members (post-stage-2 only once stage 2 fired):
+    member 1: resnest50d_best_model_epoch21.pth (val Macro-F1 0.7010 @ epoch 21, weight 0.7010)
+    member 2: resnest50d_best_model_epoch18.pth (val Macro-F1 0.6840 @ epoch 18, weight 0.6840)
+    member 1: resnest50d_best_model_epoch21.pth (val Macro-F1 0.7010 @ epoch 21, weight 0.7010)
+    member 2: resnest50d_best_model_epoch18.pth (val Macro-F1 0.6840 @ epoch 18, weight 0.6840)
+    Ensemble temperature candidates (val ECE): T=1.0 -> 0.1255 | LBFGS T=1.0425 -> 0.1377 | grid T=0.5000 -> 0.0262. Shipping T=0.5000 (grid search).
+    Ensemble fitted T 0.5000 (grid search) improved val ECE (0.1255 -> 0.0262) — accepted.
+
+    VALIDATION GATE (decision on validation only):
+        Single best val Macro-F1: 0.7202
+        Ensemble val Macro-F1   : 0.6794
+        Decision: SINGLE BEST used on test (ensemble does not beat it on validation)
+============================================================
+
+Test Macro-F1: no-TTA 0.6825 -> TTA 0.6853
+Training curves saved as 'training_curves.png'
+Trainable parameters saved as 'trainable_parameters.png'
+Generalization gap saved as 'generalization_gap.png'
+
+============================================================
+FINAL CLASSIFICATION REPORT
+============================================================
+Class      Precision    Recall       F1-Score     Support
+--------------------------------------------------------------------------------
+AKIEC      0.5667       0.7500       0.6456       68.0
+BCC        0.6847       0.7103       0.6972       107.0
+BKL        0.6892       0.7183       0.7034       213.0
+DF         0.7143       0.2778       0.4000       18.0
+MEL        0.6202       0.5708       0.5945       226.0
+NV         0.9161       0.9161       0.9161       1347.0
+VASC       0.9545       0.7500       0.8400       28.0
+--------------------------------------------------------------------------------
+Macro Avg  0.7351       0.6705       0.6853
+Weighted Avg 0.8333       0.8316       0.8308
+ROC curves saved as 'roc_curves.png'
+Precision-Recall curves saved as 'precision_recall_curves.png'
+Confusion matrix saved as 'confusion_matrix.png'
+Confidence distribution saved as 'confidence_distribution.png'
+Calibration curve saved as 'calibration_curve.png'
+
+============================================================
+FINAL MODEL EVALUATION (single best (TTA))
+============================================================
+
+Overall Accuracy       : 0.8316
+Balanced Accuracy      : 0.6705
+
+Macro Precision        : 0.7351
+Macro Recall           : 0.6705
+Macro F1               : 0.6853
+
+Weighted F1            : 0.8308
+
+Macro ROC-AUC          : 0.9637
+Weighted ROC-AUC       : 0.9534
+
+Macro PR-AUC           : 0.7760
+
+Top-1 Accuracy         : 0.8316
+Top-2 Accuracy         : 0.9527
+Top-3 Accuracy         : 0.9860
+
+Mean Confidence        : 0.8590
+Correct Confidence     : 0.8951
+Incorrect Confidence   : 0.6807
+
+Temperature scaling (Guo et al., fitted on validation):
+    Fitted T           : 0.5500 (grid search)
+    ECE before scaling : 0.0920
+    ECE after scaling  : 0.0284
+    Argmax invariance  : PASS (predictions unchanged)
+
+------------------------------------------------------------
+PER-CLASS METRICS
+------------------------------------------------------------
+Class      Precision    Recall       Specificity  F1           ROC-AUC    PR-AUC
+------------------------------------------------------------------------
+AKIEC      0.5667       0.7500       0.9799       0.6456       0.9754     0.6986
+BCC        0.6847       0.7103       0.9816       0.6972       0.9848     0.7999
+BKL        0.6892       0.7183       0.9615       0.7034       0.9450     0.7537
+DF         0.7143       0.2778       0.9990       0.4000       0.9682     0.5912
+MEL        0.6202       0.5708       0.9556       0.5945       0.9173     0.6594
+NV         0.9161       0.9161       0.8288       0.9161       0.9560     0.9773
+VASC       0.9545       0.7500       0.9995       0.8400       0.9991     0.9523
+
+============================================================
+EXPERIMENT CONFIGURATION (as run) — EXP-RESNEST-01-FINETUNE
+============================================================
+Model: ResNeSt-50d (ImageNet pretrained, correct ImageNet normalization)
+Dataset: HAM10000 (lesion-level split, unchanged) | Train: 7221 | Val: 787 | Test: 2007
+Image size: 380x380 | Eval resize: 380 (shorter side, aspect preserved)
+Batch size: 16 | Grad accum: 1 (effective batch 16) | Max epochs: 50
+Optimizer: AdamW (weight_decay=0.0001) | LRs: head 1.0e-03, layer4 1.0e-04, layer2+layer3 5.0e-05
+Scheduler: ReduceLROnPlateau(mode='max', factor=0.5, patience=5, min_lr=1e-7) on val Macro-F1 | Loss: focal | AMP: True
+Unfreezing: head (epochs 1-5) -> +layer4 (epoch 6+) -> +layer2+layer3 (plateau-gated: 4 epochs without val Macro-F1 improvement, BN running stats frozen, fired @ epoch 16); conv1+bn1+layer1 frozen
+Model selection: validation Macro-F1 (epoch 21) | validation accuracy (epoch 21)
+TTA: enabled (final evaluation only) | Ensemble: on (top-3, F1-weighted, NOT used on test (lost val gate)) | Temperature scaling: on (T=0.5500, grid search)
+MixUp: on
+Random seed: 42 | Class order: ['AKIEC', 'BCC', 'BKL', 'DF', 'MEL', 'NV', 'VASC']
+Metadata: disabled (image-only baseline, EXP-RESNEST-01-FINETUNE)
+Best validation Macro F1: 0.7010 @ epoch 21
+Test Macro-F1: no-TTA 0.6825 -> final 0.6853 | Test accuracy: 83.16%
+Ensemble: val F1 0.6794 | test F1 0.7035 | members 2
+============================================================
+Metrics saved to 'resnest50d_training_metrics.pth' (EXP-RESNEST-01-FINETUNE)
+
+    ~/Doc/LesionNet  on   master ⇡1 !1 ?7                                                                                                     ✔  took 50m 53s   at 03:58:07 PM  
