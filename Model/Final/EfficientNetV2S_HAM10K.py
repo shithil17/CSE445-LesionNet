@@ -1,5 +1,5 @@
 """
-EfficientNet-B4 / EfficientNetV2-S fine-tuning on HAM10000.
+EfficientNetV2-S fine-tuning on HAM10000.
 
 Current recipe:
   - ImageNet normalization from the active torchvision weights; aspect-preserving
@@ -15,7 +15,8 @@ Current recipe:
     1/sqrt(count) alpha weighting as the shipped imbalance mechanism.
   - Best-F1 and best-accuracy checkpoints, final-test TTA, val-gated F1-weighted
     top-K ensembling, and post-hoc temperature scaling fitted on validation logits.
-  - MixUp is the only mix augmentation and is opt-in with `use_mixup`.
+  - MixUp is the only mix augmentation and is ON by default (use_mixup=True;
+    disable with use_mixup=False / --no-mixup).
 
 Metadata fusion remains available but is disabled by default (`use_metadata=False`).
 It uses train-only fitted HAM10000 age/sex/localization preprocessing and a small
@@ -28,8 +29,8 @@ The lesion-level split is defined by `split_ham10000.py`; this script consumes
 `HAM10000_split/{train,val,test}` only.
 
 Run from the repository with:
-    .venv/bin/python 'Model/Efficientnetv2s/Experiment 1/EfficientNetV2S_HAM10K.py'
-    .venv/bin/python 'Model/Efficientnetv2s/Experiment 1/EfficientNetV2S_HAM10K.py' --backbone b4
+    .venv/bin/python 'Model/Final/EfficientNetV2S_HAM10K.py'
+    .venv/bin/python 'Model/Final/EfficientNetV2S_HAM10K.py' --no-tta --no-mixup
 
 """
 
@@ -64,62 +65,24 @@ from torchvision import datasets, models, transforms
 from tqdm import tqdm
 
 EXPERIMENT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.dirname(os.path.dirname(EXPERIMENT_DIR))
+MODEL_DIR = os.path.dirname(EXPERIMENT_DIR)
 REPO_DIR = os.path.dirname(MODEL_DIR)
 DEFAULT_TRAIN_DATA_DIR = os.path.join(MODEL_DIR, "HAM10000_split", "train")
 DEFAULT_VAL_DATA_DIR = os.path.join(MODEL_DIR, "HAM10000_split", "val")
 DEFAULT_TEST_DATA_DIR = os.path.join(MODEL_DIR, "HAM10000_split", "test")
 
-EXPERIMENT_ID_B4 = "EXP-B4-01-NORM-FINETUNE"
-METADATA_EXPERIMENT_ID_B4 = "EXP-B4-META-01"
-EXPERIMENT_ID_V2S = "EXP-V2S-01-FINETUNE"
-METADATA_EXPERIMENT_ID_V2S = "EXP-V2S-META-01"
+EXPERIMENT_ID = "EXP-V2S-01-FINETUNE"
+METADATA_EXPERIMENT_ID = "EXP-V2S-META-01"
 DEFAULT_METADATA_CSV = os.path.join(REPO_DIR, "Dataset", "HAM10000_groundtruth.csv")
 
-# ImageNet statistics are selected from the active backbone's weights — never hardcoded.
-_B4_WEIGHTS = models.EfficientNet_B4_Weights.IMAGENET1K_V1
+# EfficientNetV2-S only. ImageNet statistics come from the torchvision weights
+# metadata — never hardcoded.
 _V2S_WEIGHTS = models.EfficientNet_V2_S_Weights.IMAGENET1K_V1
-BACKBONE_CONFIGS = {
-    "b4": {
-        "display_name": "EfficientNet-B4",
-        "weights": _B4_WEIGHTS,
-        "factory": models.efficientnet_b4,
-        "experiment_id": EXPERIMENT_ID_B4,
-        "metadata_experiment_id": METADATA_EXPERIMENT_ID_B4,
-        "checkpoint_prefix": "efficientnetb4",
-        "frozen_indices": [0, 1, 2, 3],
-        "early_unfreeze_indices": [6, 7, 8],
-        "stage2_unfreeze_indices": [4, 5],
-    },
-    "v2s": {
-        "display_name": "EfficientNetV2-S",
-        "weights": _V2S_WEIGHTS,
-        "factory": models.efficientnet_v2_s,
-        "experiment_id": EXPERIMENT_ID_V2S,
-        "metadata_experiment_id": METADATA_EXPERIMENT_ID_V2S,
-        "checkpoint_prefix": "efficientnetv2s",
-        # Verified with torchvision 0.28.0: features has stem, 6 stages, head.
-        "frozen_indices": [0, 1, 2],
-        "early_unfreeze_indices": [5, 6, 7],
-        "stage2_unfreeze_indices": [3, 4],
-    },
-}
-
-
-def verify_backbone_configs():
-    """Runnable architecture guard: validates each mapping without downloading weights."""
-    for backbone, config in BACKBONE_CONFIGS.items():
-        model = config['factory'](weights=None)
-        feature_types = [(i, type(module).__name__) for i, module in enumerate(model.features)]
-        required = (config['frozen_indices'] + config['early_unfreeze_indices']
-                    + config['stage2_unfreeze_indices'])
-        assert max(required) < len(model.features), (
-            f"{backbone}: mapping {required} exceeds features length {len(model.features)}"
-        )
-        print(f"{backbone}: features len={len(model.features)}; {feature_types}; "
-              f"classifier in_features={model.classifier[1].in_features}; "
-              f"frozen={config['frozen_indices']}; early={config['early_unfreeze_indices']}; "
-              f"stage2={config['stage2_unfreeze_indices']}")
+CHECKPOINT_PREFIX = "efficientnetv2s"
+# Verified with torchvision 0.28.0: features has stem, 6 stages, head.
+FROZEN_BLOCK_INDICES = [0, 1, 2]
+EARLY_UNFREEZE_INDICES = [5, 6, 7]
+STAGE2_UNFREEZE_INDICES = [3, 4]
 
 
 def set_seed(seed):
@@ -423,13 +386,12 @@ class EfficientNetFinetuneTrainer:
         validation-gated F1-weighted top-K ensemble
       - use_metadata=False by default; True enables train-only metadata fitting
         and image/metadata MLP fusion
-      - use_mixup=False: optional MixUp with soft-target focal loss
+      - use_mixup=True: MixUp (alpha=0.2, soft-target focal) on by default
     """
 
     def __init__(
         self,
         data_dir,
-        backbone='v2s',
         val_data_dir='HAM10000_split/val',
         test_data_dir='HAM10000_split/test',
         experiment_id=None,
@@ -455,12 +417,8 @@ class EfficientNetFinetuneTrainer:
         keep_top_k_checkpoints=3,
         use_metadata=False,
         metadata_csv=DEFAULT_METADATA_CSV,
-        use_mixup=False,
+        use_mixup=True,
     ):
-        if backbone not in BACKBONE_CONFIGS:
-            raise ValueError(
-                f"Unknown backbone: {backbone!r}. Supported: {sorted(BACKBONE_CONFIGS)}."
-            )
         if loss_mode not in ('ce', 'weighted_ce', 'focal'):
             raise ValueError(
                 f"Unknown loss_mode: {loss_mode!r}. Supported: 'ce', 'weighted_ce', 'focal'."
@@ -480,17 +438,16 @@ class EfficientNetFinetuneTrainer:
             raise ValueError(
                 f"keep_top_k_checkpoints must be >= 1, got {keep_top_k_checkpoints}."
             )
-        self.backbone = backbone
-        self._backbone_config = BACKBONE_CONFIGS[backbone]
-        self.backbone_name = self._backbone_config['display_name']
-        self.weights = self._backbone_config['weights']
+        self.backbone = "v2s"
+        self.backbone_name = "EfficientNetV2-S"
+        self.weights = _V2S_WEIGHTS
         self._weights_transforms = self.weights.transforms()
         self.imagenet_mean = list(self._weights_transforms.mean)
         self.imagenet_std = list(self._weights_transforms.std)
-        self.checkpoint_prefix = self._backbone_config['checkpoint_prefix']
-        self._frozen_block_indices = self._backbone_config['frozen_indices']
-        self._early_unfreeze_indices = self._backbone_config['early_unfreeze_indices']
-        self._stage2_unfreeze_indices = self._backbone_config['stage2_unfreeze_indices']
+        self.checkpoint_prefix = CHECKPOINT_PREFIX
+        self._frozen_block_indices = FROZEN_BLOCK_INDICES
+        self._early_unfreeze_indices = EARLY_UNFREEZE_INDICES
+        self._stage2_unfreeze_indices = STAGE2_UNFREEZE_INDICES
         self._early_blocks_label = self._format_blocks(self._early_unfreeze_indices)
         self._stage2_blocks_label = self._format_blocks(self._stage2_unfreeze_indices)
         self._frozen_blocks_label = self._format_blocks(self._frozen_block_indices)
@@ -501,8 +458,7 @@ class EfficientNetFinetuneTrainer:
         self.use_metadata = use_metadata
         self.metadata_csv = metadata_csv
         self.experiment_id = experiment_id or (
-            self._backbone_config['metadata_experiment_id'] if use_metadata
-            else self._backbone_config['experiment_id']
+            METADATA_EXPERIMENT_ID if use_metadata else EXPERIMENT_ID
         )
         self.batch_size = batch_size
         self.grad_accum_steps = grad_accum_steps
@@ -778,7 +734,7 @@ class EfficientNetFinetuneTrainer:
         Linear(64 -> 32)); the 32-d embedding is concatenated with the pooled image
         features, so the final classifier receives feature_dim + 32."""
         print(f"\nBuilding {self.backbone_name} model...")
-        model = self._backbone_config['factory'](weights=self.weights)
+        model = models.efficientnet_v2_s(weights=self.weights)
         feature_types = [(i, type(module).__name__) for i, module in enumerate(model.features)]
         print(f"{self.backbone_name} features: len={len(model.features)}; {feature_types}")
         required_indices = (
@@ -1413,7 +1369,7 @@ class EfficientNetFinetuneTrainer:
             if not os.path.exists(path):
                 continue
             checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-            checkpoint_backbone = checkpoint.get('backbone', 'b4')
+            checkpoint_backbone = checkpoint.get('backbone', 'v2s')
             if checkpoint_backbone != self.backbone:
                 raise ValueError(
                     f"Ensemble checkpoint {path} has backbone={checkpoint_backbone!r}, "
@@ -2229,8 +2185,7 @@ class EfficientNetFinetuneTrainer:
             free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
             peak_bytes = torch.cuda.max_memory_allocated(self.device)
             print(f"GPU memory: peak allocated {peak_bytes / 2**30:.2f} GiB; "
-                  f"current free {free_bytes / 2**30:.2f} / {total_bytes / 2**30:.2f} GiB. "
-                  "Compare this peak with the B4 baseline before changing resolution or batch size.")
+                  f"current free {free_bytes / 2**30:.2f} / {total_bytes / 2**30:.2f} GiB")
         print(f"Best Validation Macro F1: {best_macro_f1:.4f} (epoch {best_epoch})")
         print(f"Best Validation Accuracy: {best_val_acc:.2f}% (epoch {best_acc_epoch})")
         if self._stage2_unfrozen:
@@ -2259,8 +2214,8 @@ class EfficientNetFinetuneTrainer:
             _, _, _, val_targets_single, val_probs_single = self.validate(
                 model, val_loader, criterion, epoch_label="val")
             test_probs_single, test_targets = no_tta_probs, no_tta_targets
-            _, test_logits_single = self.collect_logits(model, test_loader,
-                                                        epoch_label="test")
+            test_logits_single, _ = self.collect_logits(model, test_loader,
+                                                         epoch_label="test")
 
         single_val_f1 = self._score_probs(val_probs_single, val_targets_single)['macro_f1']
 
@@ -2443,10 +2398,10 @@ class EfficientNetFinetuneTrainer:
         print(f"MixUp: {'on' if self.use_mixup else 'off'}")
         print(f"Random seed: {self.seed} | Class order: {self.class_names}")
         if self.use_metadata:
-            print(f"Metadata: ENABLED ({self._backbone_config['metadata_experiment_id']}) — dim {self.metadata_dim}, "
+            print(f"Metadata: ENABLED ({METADATA_EXPERIMENT_ID}) — dim {self.metadata_dim}, "
                   f"MLP -> 64 -> 32, fusion concat(image features, metadata embedding)")
         else:
-            print(f"Metadata: disabled (image-only baseline, {self._backbone_config['experiment_id']})")
+            print(f"Metadata: disabled (image-only baseline, {EXPERIMENT_ID})")
         print(f"Best validation Macro F1: {best_macro_f1:.4f} @ epoch {best_epoch}")
         print(f"Test Macro-F1: no-TTA {no_tta_f1:.4f} -> final {tta_f1:.4f} | "
               f"Test accuracy: {final_acc:.2f}%")
@@ -2498,7 +2453,6 @@ class EfficientNetFinetuneTrainer:
             'best_acc_epoch': best_acc_epoch,
             'no_tta_macro_f1': no_tta_f1,
             'tta_macro_f1': tta_f1,
-            'tta_single_scale_macro_f1': tta_single_scale_f1,
             'final_accuracy': final_acc,
             'total_training_time': total_training_time,
             'epochs_trained': len(history['train_loss']),
@@ -2530,12 +2484,12 @@ class EfficientNetFinetuneTrainer:
         stale file can never silently corrupt a fresh run's results. num_epochs is
         the one exception: resuming with MORE epochs is allowed (ReduceLROnPlateau
         has no fixed schedule tail to extend); shrinking is refused."""
-        checkpoint_backbone = checkpoint.get('backbone', 'b4')
+        checkpoint_backbone = checkpoint.get('backbone', 'v2s')
         if checkpoint_backbone != self.backbone:
             raise ValueError(
                 f"Cannot resume: checkpoint backbone={checkpoint_backbone!r} but this run "
                 f"uses backbone={self.backbone!r}. Checkpoints are architecture-specific; "
-                f"choose the matching --backbone or start a fresh run."
+                f"start a fresh run."
             )
         expected = {
             'experiment_id': self.experiment_id,
@@ -2592,14 +2546,10 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="EfficientNet B4/V2-S HAM10000 trainer (image-only or image+metadata).")
-    parser.add_argument("--backbone", choices=sorted(BACKBONE_CONFIGS), default="v2s",
-                        help="backbone for this experiment (default: %(default)s)")
-    parser.add_argument("--verify-backbone", action="store_true",
-                        help="print and validate the installed feature layout, then exit")
+        description="EfficientNetV2-S HAM10000 trainer (image-only or image+metadata).")
     parser.add_argument(
         "--use-metadata", action="store_true",
-        help="enable image+metadata fusion for the selected backbone")
+        help="enable image+metadata fusion")
     parser.add_argument(
         "--metadata-csv", default=DEFAULT_METADATA_CSV,
         help="ground-truth CSV with metadata columns (default: %(default)s)")
@@ -2614,8 +2564,8 @@ if __name__ == "__main__":
                         help="epochs without val Macro-F1 improvement before the "
                              "stage-2 unfreeze fires (default: %(default)s)")
     parser.add_argument("--resume-checkpoint", default=None,
-                        help="explicit backbone-matched last checkpoint; defaults to the "
-                             "namespaced checkpoint in this experiment directory")
+                        help="explicit checkpoint path; defaults to the namespaced "
+                             "last checkpoint in this experiment directory")
     parser.add_argument("--use-ensemble", dest="use_ensemble", action="store_true",
                         default=True, help="F1-weighted top-K ensemble (default: on)")
     parser.add_argument("--no-ensemble", dest="use_ensemble", action="store_false",
@@ -2623,29 +2573,27 @@ if __name__ == "__main__":
     parser.add_argument("--keep-top-k", type=int, default=3,
                         help="top-K best checkpoints kept for the ensemble "
                              "(default: %(default)s)")
-    parser.add_argument("--use-mixup", action="store_true",
-                        help="opt-in MixUp (alpha=0.2, soft-target focal)")
+    parser.add_argument("--use-mixup", dest="use_mixup", action="store_true",
+                        default=True,
+                        help="MixUp (alpha=0.2, soft-target focal) (default: on)")
+    parser.add_argument("--no-mixup", dest="use_mixup", action="store_false",
+                        help="disable MixUp")
     parser.add_argument("--no-tta", dest="use_tta", action="store_false",
                         help="disable test-time augmentation")
     args = parser.parse_args()
 
-    if args.verify_backbone:
-        verify_backbone_configs()
-        raise SystemExit(0)
-
-    # Keep all V2-S experiment outputs in this copied experiment directory.
+    # Keep all V2-S experiment outputs in this experiment directory.
     os.chdir(EXPERIMENT_DIR)
 
     # Auto-resume when a last checkpoint exists (crash recovery); start fresh otherwise.
     resume_path = args.resume_checkpoint or \
-        f"{BACKBONE_CONFIGS[args.backbone]['checkpoint_prefix']}_last_checkpoint.pth"
+        f"{CHECKPOINT_PREFIX}_last_checkpoint.pth"
     if not os.path.exists(resume_path):
         resume_path = None
     trainer = EfficientNetFinetuneTrainer(
         data_dir=DEFAULT_TRAIN_DATA_DIR,
         val_data_dir=DEFAULT_VAL_DATA_DIR,
         test_data_dir=DEFAULT_TEST_DATA_DIR,
-        backbone=args.backbone,
         num_epochs=args.num_epochs,
         seed=args.seed,
         resume_checkpoint=resume_path,
