@@ -17,6 +17,7 @@ dependencies = [
     "tqdm",
     "matplotlib",
     "seaborn",
+    "gradio>=6.23.1",
     "timm>=1.0.28",
 ]
 
