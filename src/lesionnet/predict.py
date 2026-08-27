@@ -74,8 +74,12 @@ def build_result_image(original, overlay, probs, gender, age):
     return composite
 
 
-def predict_full(image, gender, age):
+def predict_full(image, gender, age, output_dir=None):
     """predict() + Grad-CAM overlay + composite image + written file path."""
+    if isinstance(image, (str, Path)):
+        image_path = Path(image)
+        image = PIL.Image.open(image_path)
+        image.filename = str(image_path)
     image_filename = getattr(image, "filename", None)
     original = image.convert("RGB")
     result = predict(original)
@@ -91,8 +95,10 @@ def predict_full(image, gender, age):
     composite = build_result_image(original, overlay, result["probs"], gender, age)
 
     stem = Path(image_filename).stem if image_filename else "result"
-    overlay_path = Path("/tmp") / f"{stem}_overlay.png"
-    composite_path = Path("/tmp") / f"{stem}_result.png"
+    out_dir = Path(output_dir) if output_dir else Path("/tmp")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    overlay_path = out_dir / f"{stem}_overlay.png"
+    composite_path = out_dir / f"{stem}_result.png"
     overlay.save(overlay_path)
     composite.save(composite_path)
 
