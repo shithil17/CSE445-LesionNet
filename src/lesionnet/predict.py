@@ -8,16 +8,78 @@ import torch
 import torch.nn.functional as F
 from torchvision import transforms
 
-from lesionnet.config import CLASS_NAMES, IMAGE_SIZE
-from lesionnet.model import load_model
+from lesionnet.config import (
+    CLASS_NAMES,
+    DEVICE,
+    ENSEMBLE_TEMPERATURE,
+    EVAL_RESIZE,
+    IMAGE_SIZE,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+)
+from lesionnet.model import load_ensemble
 from lesionnet.xai import GradCAM, render_overlay
 
+# Deterministic eval transform, mirror of _build_transforms() in
+# Model/Final/EfficientNetV2S_HAM10K.py (lines 561-566).
 _transform = transforms.Compose(
     [
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.Resize(EVAL_RESIZE),  # shorter side, aspect preserved
+        transforms.CenterCrop(IMAGE_SIZE),
         transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ]
 )
+
+
+def _tta_views(tensor):
+    """Deterministic TTA views, mirror of predict_with_tta() n_augments=4:
+    identity, horizontal flip, +5° rotation, -5° rotation."""
+    return (
+        tensor,
+        torch.flip(tensor, dims=[2]),
+        transforms.functional.rotate(tensor, 5),
+        transforms.functional.rotate(tensor, -5),
+    )
+
+
+def _apply_temperature(logits, temperature):
+    """Mirror of EfficientNetV2S_HAM10K._apply_temperature (line 1139):
+    softmax(logits / T) with max-subtraction stability."""
+    shifted = (logits - logits.max(axis=1, keepdims=True)) / temperature
+    exp = np.exp(shifted)
+    return exp / exp.sum(axis=1, keepdims=True)
+
+
+def _ensemble_probs(tensor):
+    """F1-weighted TTA ensemble probs (numpy, 7,). Each member contributes
+    softmax(mean TTA logits) * val-Macro-F1 weight, like _ensemble_probs()."""
+    tensor = tensor.to(DEVICE)
+    probs_sum = None
+    weight_sum = 0.0
+    for model, weight in load_ensemble():
+        logits_sum = None
+        n_views = 0
+        with torch.no_grad():
+            for view in _tta_views(tensor):
+                logits = model(view.unsqueeze(0))
+                logits_sum = logits if logits_sum is None else logits_sum + logits
+                n_views += 1
+        probs = F.softmax(logits_sum / n_views, dim=1)[0]
+        probs_sum = probs * weight if probs_sum is None else probs_sum + probs * weight
+        weight_sum += weight
+    return (probs_sum / weight_sum).cpu().numpy()
+
+
+def _temperature_scaled(probs):
+    """Apply the shipped ensemble temperature to the averaged probs via
+    log(probs)/T, exactly like fit_temperature_on_probs() /
+    _grid_search_temperature(is_probs=True). Argmax must be unchanged."""
+    log_probs = np.log(np.clip(probs, 1e-12, 1.0))[None, :]
+    scaled = _apply_temperature(log_probs, ENSEMBLE_TEMPERATURE)[0]
+    if int(np.argmax(scaled)) != int(np.argmax(probs)):
+        raise RuntimeError("temperature scaling changed the argmax prediction")
+    return scaled
 
 
 def predict(image):
@@ -26,12 +88,8 @@ def predict(image):
     probs are in CLASS_NAMES order (index == class_to_idx).
     """
     image = image.convert("RGB")
-    model = load_model()
-    device = next(model.parameters()).device
-    tensor = _transform(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        logits = model(tensor)
-    probs = F.softmax(logits[0], dim=0).cpu().numpy()
+    tensor = _transform(image)
+    probs = _temperature_scaled(_ensemble_probs(tensor))
     idx = int(probs.argmax())
     return {
         "probs": probs,
@@ -75,7 +133,7 @@ def build_result_image(original, overlay, probs, gender, age):
 
 
 def predict_full(image, gender, age, output_dir=None):
-    """predict() + Grad-CAM overlay + composite image + written file path."""
+    """predict() + Grad-CAM overlay + composite image + written file paths."""
     if isinstance(image, (str, Path)):
         image_path = Path(image)
         image = PIL.Image.open(image_path)
@@ -84,7 +142,7 @@ def predict_full(image, gender, age, output_dir=None):
     original = image.convert("RGB")
     result = predict(original)
 
-    cam_model = GradCAM(load_model())
+    cam_model = GradCAM(load_ensemble()[0][0])
     try:
         tensor = _transform(original)
         cam = cam_model.generate(tensor, int(np.argmax(result["probs"])))

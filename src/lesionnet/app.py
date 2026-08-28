@@ -230,11 +230,12 @@ def _render_readout(probs: dict[str, float]) -> str:
           <div class="cls">{top_class}</div>
           <div class="conf confidence-value" data-target="{top_conf:.1f}">0.0%</div>
         </div>
-        <div class="headline-sub">Top prediction · classification confidence</div>
+        <div class="headline-sub">Top prediction · ensemble confidence</div>
         <div class="bars">{"".join(rows)}</div>
         <div class="divider"></div>
         <div class="meta-row">
-          <span><b>MODEL</b> EfficientNet-B4</span>
+          <span><b>MODEL</b> EfficientNet-V2S Ensemble (2)</span>
+          <span><b>TEMP</b> T=0.6</span>
           <span><b>CLASSES</b> {len(CLASS_NAMES)}</span>
           <span><b>XAI</b> Grad-CAM</span>
         </div>
@@ -249,15 +250,15 @@ def build_ui() -> gr.Blocks:
             gr.HTML('''<header class="les-header">
                 <div class="brand">
                   <h1>LESIONNET</h1>
-                  <span class="tag">Dermoscopic Classification · Grad-CAM Explainability</span>
+                  <span class="tag">Dermoscopic Classification · 2-Model Ensemble · Grad-CAM Explainability</span>
                 </div>
-                <div class="status"><span class="dot"></span> EFFICIENTNET-B4 · MODEL LOADED</div>
+                <div class="status"><span class="dot"></span> EFFICIENTNET-V2S ENSEMBLE · MODEL LOADED</div>
             </header>''')
 
             with gr.Row(elem_classes=["main-grid"]):
                 with gr.Column(elem_classes=["left-column"]):
                     with gr.Column(elem_classes=["panel"]):
-                        gr.HTML('<div class="panel-head"><b>01 · Specimen Input</b><span>224×224 · RGB</span></div>')
+                        gr.HTML('<div class="panel-head"><b>01 · Specimen Input</b><span>380×380 · RGB</span></div>')
                         with gr.Column(elem_classes=["panel-body"]):
                             image = gr.Image(
                                 type="pil",

@@ -4,12 +4,16 @@ import torch
 import torch.nn as nn
 from torchvision import models
 
-from lesionnet.config import CLASS_NAMES, DEVICE, MODEL_PATH
+from lesionnet.config import CLASS_NAMES, DEVICE, ENSEMBLE_MEMBERS, MODEL_DIR
 
 
 def build_model(num_classes: int = 7) -> nn.Module:
-    """Literal mirror of Model/EfficientNetB4_HAM10K.py:121-135."""
-    model = models.efficientnet_b4(weights=models.EfficientNet_B4_Weights.IMAGENET1K_V1)
+    """Mirror of the image-only path of Model/Final/EfficientNetV2S_HAM10K.py
+    build_model() (lines 737-781): EfficientNetV2-S + Dropout(0.2) +
+    Linear(1280, 7)."""
+    model = models.efficientnet_v2_s(
+        weights=models.EfficientNet_V2_S_Weights.IMAGENET1K_V1
+    )
     for param in model.parameters():
         param.requires_grad = False
     num_features = model.classifier[1].in_features
@@ -21,15 +25,27 @@ def build_model(num_classes: int = 7) -> nn.Module:
 
 
 @functools.lru_cache(maxsize=1)
-def load_model() -> nn.Module:
-    """Load the trained checkpoint once and cache it (eval mode)."""
-    model = build_model(num_classes=len(CLASS_NAMES)).to(DEVICE)
-    state_dict = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    missing, unexpected = model.load_state_dict(state_dict)
-    if missing or unexpected:
-        raise RuntimeError(
-            f"Checkpoint/architecture mismatch: {len(missing)} missing, "
-            f"{len(unexpected)} unexpected keys"
-        )
-    model.eval()
-    return model
+def load_ensemble() -> list[tuple[nn.Module, float]]:
+    """Load the F1-weighted ensemble members once and cache them (eval mode).
+
+    Returns [(model, weight)] with weight = each checkpoint's saved val
+    Macro-F1, matching _ensemble_probs() in the training script
+    (EfficientNetV2S_HAM10K.py:1356).
+    """
+    ensemble = []
+    for name in ENSEMBLE_MEMBERS:
+        path = MODEL_DIR / name
+        checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
+        if checkpoint.get("backbone", "v2s") != "v2s":
+            raise ValueError(f"Checkpoint {name} is not an EfficientNet-V2S model")
+        model = build_model(num_classes=len(CLASS_NAMES)).to(DEVICE)
+        missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"])
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Checkpoint/architecture mismatch in {name}: {len(missing)} missing, "
+                f"{len(unexpected)} unexpected keys"
+            )
+        model.eval()
+        f1 = float(checkpoint.get("best_macro_f1", 1.0))
+        ensemble.append((model, max(f1, 1e-6)))
+    return ensemble
